@@ -1,5 +1,9 @@
 # 更新记录
 
+## v1.8.4
+
+- 提示词明确内容搜索走内置 `grep`（ripgrep），不要用 `Select-String` 或 `Get-ChildItem -Recurse | Select-String`（慢路径）；`Select-String` 只用于过滤命令自身的输出。
+
 ## v1.8.3
 
 - 修正等待写法：不再推荐 `ping`（会弹控制台窗口）；`timeout /t` 在 fastsh 下必定失败（stdin 被重定向）。改用 `powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds N"`，并优先用后台任务代替前台睡眠。
