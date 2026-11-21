@@ -150,23 +150,23 @@ const signal = new AbortController().signal
   check('background shape', value.background === true && typeof value.pid === 'number', JSON.stringify(value))
 }
 
-// background ends the turn by default
+// background keeps the turn by default, so the model still sends a message
 {
   let concluded = 0
   const runExec = { signal, concludeTurn: () => (concluded += 1) }
   const value = await definition.execute({ description: 'bg2', command: 'echo bg', run_in_background: true }, runExec)
-  check('background concludes turn', value.concluded === true && concluded === 1, JSON.stringify({ concluded, value }))
+  check('background keeps turn by default', !value.concluded && concluded === 0, JSON.stringify({ concluded, value }))
 }
 
-// conclude_turn: false keeps the turn alive
+// conclude_turn: true ends the turn immediately
 {
   let concluded = 0
   const runExec = { signal, concludeTurn: () => (concluded += 1) }
   const value = await definition.execute(
-    { description: 'bg3', command: 'echo bg', run_in_background: true, conclude_turn: false },
+    { description: 'bg3', command: 'echo bg', run_in_background: true, conclude_turn: true },
     runExec,
   )
-  check('conclude_turn false', !value.concluded && concluded === 0, JSON.stringify({ concluded, value }))
+  check('conclude_turn true', value.concluded === true && concluded === 1, JSON.stringify({ concluded, value }))
 }
 
 // foreground never concludes the turn
