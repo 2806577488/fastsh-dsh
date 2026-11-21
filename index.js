@@ -152,6 +152,18 @@ function renderText(value) {
   return parts.join('\n')
 }
 
+/**
+ * The job card renders `label` as both its title and its `$ <label>` line, and
+ * the service stores no separate command field — so the command has to be the
+ * label, or the card says nothing about what is running.
+ */
+function jobLabel(description, command) {
+  const text = String(command ?? '').replace(/\s+/g, ' ').trim()
+  const short = text.length > 120 ? `${text.slice(0, 117)}...` : text
+  if (short) return short
+  return typeof description === 'string' && description ? description : 'background job'
+}
+
 /** Open a DSH job when the jobs service and its controller are available. */
 function tryStartJob(ctx, request, input, exec) {
   const jobs = ctx.get('jobs')
@@ -164,10 +176,7 @@ function tryStartJob(ctx, request, input, exec) {
       cwd: request.cwd,
       shell: request.shell,
       encoding: request.encoding,
-      label:
-        typeof input.description === 'string' && input.description
-          ? input.description
-          : request.command.slice(0, 60),
+      label: jobLabel(input.description, request.command),
       owner: exec?.agent?.id,
       toolCall: callId ? { callId, rootCallId: exec.rootCallId ?? callId } : undefined,
       outputLimitBytes: clampOutputLimit(input.outputLimitBytes),

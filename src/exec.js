@@ -912,14 +912,33 @@ export function startBackgroundJob(request) {
         settle('failed', error?.message ?? String(error))
       })
 
-      child.on('close', (exitCode) => {
+      // 'close' waits for every inherited pipe to be released. A grandchild
+      // that outlives the tracked process can therefore keep a finished job
+      // "running" forever, so 'exit' settles it after a short grace.
+      let exitCodeSeen = null
+      let exitTimer = null
+      const settleFromExit = (code) => {
         drainDecoders()
         closeLog()
         // The registry merges the caller's kill reason into `detail`; do not
         // repeat it here.
         if (killReason !== null) settle('killed')
-        else if (exitCode === 0) settle('completed', 'exit code 0')
-        else settle('failed', `exit code ${exitCode ?? 'unknown'}`)
+        else if (code === 0) settle('completed', 'exit code 0')
+        else settle('failed', `exit code ${code ?? 'unknown'}`)
+      }
+
+      child.on('exit', (code) => {
+        exitCodeSeen = code
+        exitTimer = setTimeout(() => settleFromExit(exitCodeSeen), 1500)
+        exitTimer.unref?.()
+      })
+
+      child.on('close', (exitCode) => {
+        if (exitTimer) {
+          clearTimeout(exitTimer)
+          exitTimer = null
+        }
+        settleFromExit(exitCode)
       })
 
       return {
