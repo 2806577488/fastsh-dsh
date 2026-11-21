@@ -1,0 +1,40 @@
+{
+  "name": "dsh-fastsh",
+  "version": "1.4.1",
+  "description": "Fast, encoding-safe Windows command execution for DSH: cmd.exe plus a native PowerShell subset, replacing the pwsh tool.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "src",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "shell",
+    "cmd",
+    "windows",
+    "powershell",
+    "utf-8"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
