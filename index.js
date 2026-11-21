@@ -13,7 +13,7 @@ export const name = 'fastsh'
 /** The tool registry is the only hard dependency. */
 export const inject = ['tools']
 
-const PROMPT_SECTION = `All Windows shell commands MUST run through the \`fastsh\` tool. The \`pwsh\` tool is disabled in this profile: calling it is an error. fastsh runs plain commands on cmd.exe and runs common PowerShell (Get-ChildItem, Get-Content, Test-Path, Select/Where/ForEach/Sort/Measure-Object, $env:, [System.IO.File]::) natively in milliseconds; only commands outside that subset fall back to Windows PowerShell. Start long work with run_in_background: it returns a job id and ends the turn, and DSH notifies you when it settles, so do not poll or sleep on it.`
+const PROMPT_SECTION = `All Windows shell commands MUST run through the \`fastsh\` tool. The \`pwsh\` tool is disabled in this profile: calling it is an error. Plain commands run on cmd.exe; common PowerShell (Get-ChildItem, Get-Content, Test-Path, Select/Where/ForEach/Sort/Measure-Object, $env:, [System.IO.File]::) runs natively in milliseconds, and anything outside that subset falls back to Windows PowerShell. Any command that may run longer than about 30 seconds — builds, package installs, test suites, downloads, emulator runs, migrations — MUST pass run_in_background: true and leave conclude_turn at its default. That returns a job id and ends the turn; never run such a command in the foreground and never raise timeoutMs to cover it. DSH notifies you when the job settles, so do not poll job_output while it runs.`
 
 /** PowerShell tool this plugin replaces. */
 const REPLACED_TOOL = 'pwsh'
@@ -49,7 +49,7 @@ const PARAMETERS = {
     run_in_background: {
       type: 'boolean',
       description:
-        'Start the command as a DSH background job and return its job id immediately, without waiting. Read it with job_output, list it with job_list, and stop it with job_kill. The job outlives this turn and is torn down with the session. When the jobs service is unavailable the command is started detached instead and pid plus UTF-8 log paths are returned.',
+        'Required for any command that may run longer than about 30 seconds (builds, installs, tests, downloads, emulators, migrations); optional below that. Starts the command as a DSH background job and returns its job id immediately, without waiting. Read it with job_output, list it with job_list, and stop it with job_kill. The job outlives this turn and is torn down with the session. When the jobs service is unavailable the command is started detached instead and pid plus UTF-8 log paths are returned.',
     },
     outputLimitBytes: {
       type: 'number',
