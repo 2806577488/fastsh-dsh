@@ -1,5 +1,9 @@
 # 更新记录
 
+## v1.8.3
+
+- 修正等待写法：不再推荐 `ping`（会弹控制台窗口）；`timeout /t` 在 fastsh 下必定失败（stdin 被重定向）。改用 `powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds N"`，并优先用后台任务代替前台睡眠。
+
 ## v1.8.2
 
 - 系统提示加入命令构造规则：用 `&&` 而不是 `&`；等待用 `ping`/`timeout`；不要前台 sleep 轮询；判断文件是否变化用秒级 mtime/哈希而不是 `ls -l`；不要用 `powershell -Command` 包一层 cmd。
