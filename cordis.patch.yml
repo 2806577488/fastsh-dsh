@@ -1,0 +1,9 @@
+# fastsh：比 PowerShell 快约 10 倍的 Windows 命令执行工具（DSH Host 插件）
+#
+# 插入一行 `fastsh` 工具：普通命令走 cmd.exe；常见 PowerShell 命令
+# （Get-ChildItem/Get-Content/Select-String/Get-Process/Get-Date…、
+# $env:、[System.IO.*]::、管道与重定向）用 Node 原生实现，毫秒级；
+# 子集之外才回退 Windows PowerShell。子进程继承 DSH 进程的令牌。
+- insert:
+    - id: fastsh
+      name: 'dsh-fastsh'

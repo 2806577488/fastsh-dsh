@@ -1,0 +1,123 @@
+import { runCommand, runInBackground, decodeOutput, detectPowerShell } from '../src/exec.js'
+import { readFileSync, existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
+/** Sleep command that starts no PING.EXE. */
+const SLEEP = `"${process.execPath}" "${fileURLToPath(new URL('./sleep.cjs', import.meta.url))}"`
+
+const results = []
+function check(name, ok, detail) {
+  results.push({ name, ok, detail })
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}  ${detail ?? ''}`)
+}
+
+// 1. basic + Chinese (GBK from cmd built-ins)
+{
+  const r = await runCommand({ command: 'echo 中文ABC & echo 第二行', cwd: 'C:\\Windows' })
+  check('chinese gbk decode', r.exitCode === 0 && r.stdout.includes('中文ABC') && r.stdout.includes('第二行'), JSON.stringify(r.stdout))
+  check('gbk detected', r.stdoutEncoding === 'gbk', r.stdoutEncoding)
+}
+
+// 2. exit code propagation
+{
+  const r = await runCommand({ command: 'exit /b 7', cwd: 'C:\\Windows' })
+  check('exit code', r.exitCode === 7, String(r.exitCode))
+}
+
+// 2b. multi-line command runs every line (cmd stops at a newline otherwise)
+{
+  const r = await runCommand({ command: 'echo one\necho two', cwd: 'C:\\Windows' })
+  check('multi-line command', r.stdout.includes('one') && r.stdout.includes('two'), JSON.stringify(r.stdout))
+}
+
+// 3. stderr
+{
+  const r = await runCommand({ command: 'echo boom 1>&2', cwd: 'C:\\Windows' })
+  check('stderr captured', r.stdout === '' && r.stderr.trim() === 'boom', JSON.stringify(r.stderr))
+}
+
+// 4. cwd
+{
+  const r = await runCommand({ command: 'echo %CD%', cwd: 'C:\\Windows' })
+  check('cwd honoured', r.stdout.trim() === 'C:\\Windows', r.stdout.trim())
+}
+
+// 5. quoting preserved
+{
+  const r = await runCommand({ command: 'echo "a & b"', cwd: 'C:\\Windows' })
+  check('quoting preserved', r.stdout.trim() === '"a & b"', r.stdout.trim())
+}
+
+// 6. powershell mode
+{
+  const r = await runCommand({ command: 'Get-ChildItem C:\\Windows | Select-Object -First 1 | ForEach-Object { $_.Name }', cwd: 'C:\\Windows', shell: 'powershell' })
+  check('powershell mode', r.exitCode === 0 && r.stdout.trim().length > 0, `${r.durationMs}ms ${JSON.stringify(r.stdout.slice(0, 40))}`)
+}
+
+// 7. timeout kill
+{
+  const r = await runCommand({ command: `${SLEEP} 30000`, cwd: 'C:\\Windows', timeoutMs: 1200 })
+  check('timeout kills', r.timedOut === true && r.durationMs < 8000, `${r.durationMs}ms exit=${r.exitCode}`)
+}
+
+// 8. abort
+{
+  const ac = new AbortController()
+  setTimeout(() => ac.abort(), 800)
+  const r = await runCommand({ command: `${SLEEP} 30000`, cwd: 'C:\\Windows' }, ac.signal)
+  check('abort kills', r.aborted === true, `${r.durationMs}ms`)
+}
+
+// 9. background
+{
+  const bg = runInBackground({ command: `${SLEEP} 2000 & echo BACKGROUND_DONE`, cwd: 'C:\\Windows' })
+  await new Promise((r) => setTimeout(r, 3500))
+  const out = existsSync(bg.stdoutPath) ? readFileSync(bg.stdoutPath, 'utf8') : ''
+  check('background log', out.includes('BACKGROUND_DONE'), JSON.stringify(out))
+}
+
+// 10. decoder unit cases
+{
+  const gbk = decodeOutput(Buffer.from('d6d0cec4', 'hex'))
+  check('decode gbk bytes', gbk.text === '中文' && gbk.encoding === 'gbk', JSON.stringify(gbk))
+  const bom = decodeOutput(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('hi')]))
+  check('strip utf8 bom', bom.text === 'hi', JSON.stringify(bom))
+  const u16 = decodeOutput(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('中文', 'utf16le')]))
+  check('utf16le bom', u16.text === '中文', JSON.stringify(u16))
+}
+
+// 11. shell auto-detection
+{
+  const powershell = [
+    'Get-ChildItem C:\\Windows',
+    'Get-Service | Where-Object Status -eq Running',
+    '$env:DSH_HOME',
+    '[System.IO.File]::Exists("x")',
+    'Select-Object -First 1',
+    'ForEach-Object { $_ }',
+  ]
+  const cmd = [
+    'dir /b',
+    'echo %CD%',
+    'for /l %i in (1,1,3) do @echo %i',
+    'git status',
+    'copy a b',
+    'where.exe node',
+  ]
+  for (const c of powershell) check(`detect PS: ${c.slice(0, 26)}`, detectPowerShell(c) === true, String(detectPowerShell(c)))
+  for (const c of cmd) check(`detect cmd: ${c.slice(0, 26)}`, detectPowerShell(c) === false, String(detectPowerShell(c)))
+}
+
+// 12. auto mode actually routes PowerShell syntax
+{
+  const r = await runCommand({ command: 'Get-ChildItem C:\\Windows | Select-Object -First 1 | ForEach-Object { $_.Name }', cwd: 'C:\\Windows' })
+  check('auto routes to powershell', r.exitCode === 0 && r.stdout.trim().length > 0, `${r.durationMs}ms ${JSON.stringify(r.stdout.slice(0, 30))}`)
+}
+{
+  const r = await runCommand({ command: 'echo %CD%', cwd: 'C:\\Windows' })
+  check('auto keeps cmd for cmd syntax', r.stdout.trim() === 'C:\\Windows', r.stdout.trim())
+}
+
+const failed = results.filter((r) => !r.ok)
+console.log(`\n${results.length - failed.length}/${results.length} passed`)
+process.exit(failed.length ? 1 : 0)

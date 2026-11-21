@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "极速命令执行",
+    "description": "所有 Windows 命令改走 cmd.exe 而不再启动 PowerShell：本机冷启动约 0.15 秒（PowerShell 约 1.5 秒），沿用当前用户权限，并按 UTF-8 / GBK 正确解码输出。提供 fastsh 工具并停用 pwsh 工具，所有模型都必须用它；PowerShell cmdlet 或 .NET 传 shell: \"powershell\"。后台任务会变成 DSH job，返回 job id 并结束本轮。"
+  }
+}

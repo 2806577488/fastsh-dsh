@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Fast shell",
+    "description": "Runs every Windows command through cmd.exe instead of PowerShell: about 0.15 s startup instead of about 1.5 s on this machine, the same user permissions, and GBK/UTF-8 output decoded correctly. Adds the fastsh tool and disables the pwsh tool, so all models must use it; pass shell: \"powershell\" for PowerShell cmdlets or .NET. Background runs become DSH jobs, return a job id, and end the turn."
+  }
+}
