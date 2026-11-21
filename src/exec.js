@@ -16,7 +16,7 @@ import { randomUUID } from 'node:crypto'
 import { closeSync, mkdirSync, openSync, writeFileSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { runNativePowerShell } from './ps.js'
+import { Worker } from 'node:worker_threads'
 
 export const DEFAULT_TIMEOUT_MS = 120_000
 export const MIN_TIMEOUT_MS = 1_000
@@ -266,20 +266,150 @@ function shape(text, maxChars, encoding) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Native engine isolation
+// ---------------------------------------------------------------------------
+
+const NATIVE_TIMEOUT_MS = 60_000
+let nativeWorker = null
+let nativeSequence = 0
+const nativePending = new Map()
+let nativeChain = Promise.resolve()
+
+function failNativeWorker(error) {
+  const pending = [...nativePending.values()]
+  nativePending.clear()
+  for (const entry of pending) entry.reject(error)
+  nativeWorker = null
+}
+
+function ensureNativeWorker() {
+  if (nativeWorker) return nativeWorker
+  const worker = new Worker(new URL('./native-worker.mjs', import.meta.url))
+  worker.on('message', (message) => {
+    const entry = nativePending.get(message.id)
+    if (!entry) return
+    nativePending.delete(message.id)
+    if (message.error) entry.reject(new Error(message.error))
+    else entry.resolve(message.result)
+  })
+  worker.on('error', (error) => failNativeWorker(error))
+  worker.on('exit', () => {
+    if (nativeWorker === worker) nativeWorker = null
+    failNativeWorker(new Error('native worker exited'))
+  })
+  worker.unref()
+  nativeWorker = worker
+  return worker
+}
+
+/**
+ * One native command at a time. On timeout the wedged worker is terminated —
+ * the only reliable way to stop a catastrophic regex — and the next call gets
+ * a fresh one.
+ */
+function runNativeIsolated(command, cwd, timeoutMs, signal) {
+  const run = () =>
+    new Promise((resolve) => {
+      let worker
+      try {
+        worker = ensureNativeWorker()
+      } catch (error) {
+        resolve({ error: error?.message ?? String(error) })
+        return
+      }
+
+      const id = ++nativeSequence
+      let settled = false
+      const settle = (value) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        nativePending.delete(id)
+        resolve(value)
+      }
+      const onAbort = () => {
+        settle({ aborted: true })
+        worker.terminate().catch(() => {})
+      }
+      const timer = setTimeout(() => {
+        settle({ timedOut: true })
+        worker.terminate().catch(() => {})
+      }, timeoutMs)
+
+      if (signal) {
+        if (signal.aborted) {
+          settle({ aborted: true })
+          return
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+
+      nativePending.set(id, {
+        resolve: (result) => settle(result),
+        reject: (error) => settle({ error: error?.message ?? String(error) }),
+      })
+      try {
+        worker.postMessage({ id, command, cwd })
+      } catch (error) {
+        settle({ error: error?.message ?? String(error) })
+      }
+    })
+
+  const next = nativeChain.then(run, run)
+  nativeChain = next.then(
+    () => undefined,
+    () => undefined,
+  )
+  return next
+}
+
+function nativeAbortedResult(startedAt) {
+  return {
+    exitCode: null,
+    signal: null,
+    timedOut: false,
+    aborted: true,
+    durationMs: Date.now() - startedAt,
+    stdout: '',
+    stderr: '',
+    stdoutEncoding: 'none',
+    stderrEncoding: 'none',
+    truncated: false,
+  }
+}
+
+function nativeTimedOutResult(startedAt) {
+  return {
+    exitCode: null,
+    signal: null,
+    timedOut: true,
+    aborted: false,
+    durationMs: Date.now() - startedAt,
+    stdout: '',
+    stderr: '',
+    stdoutEncoding: 'none',
+    stderrEncoding: 'none',
+    truncated: false,
+  }
+}
+
 /**
  * Run one command to completion.
  * @param {{ command: string, cwd: string, timeoutMs?: number, maxChars?: number,
- *           shell?: 'cmd'|'powershell', encoding?: string }} request
+ *           shell?: 'cmd'|'powershell', encoding?: string, logFile?: string }} request
  * @param {AbortSignal} [signal]
  */
 export function runCommand(request, signal) {
   const { command, cwd, shell = 'auto', encoding = 'auto', logFile } = request
   const timeoutMs = clampTimeout(request.timeoutMs)
   const maxChars = clampMaxChars(request.maxChars)
+  const startedAt = Date.now()
 
-  return new Promise((resolve) => {
-    const startedAt = Date.now()
-    let { file, args, options } = shellCommand(command, shell)
+  const execute = (native) =>
+    new Promise((resolve) => {
+      let { file, args, options } = shellCommand(command, shell)
 
     if (signal?.aborted) {
       resolve({
@@ -297,16 +427,13 @@ export function runCommand(request, signal) {
       return
     }
 
-    // PowerShell-looking commands that Node can do itself never boot the
-    // PowerShell engine. Anything outside the native subset falls through.
-    if (shell !== 'powershell' && detectPowerShell(command)) {
-      const native = runNativePowerShell(command, { cwd, env: process.env })
-      if (native?.delegate) {
+    if (native) {
+      if (native.delegate) {
         // `& exe args` runs the target directly, without a shell wrapper.
         file = native.delegate.file
         args = native.delegate.args
         options = {}
-      } else if (native) {
+      } else {
         const out = shape(native.stdout ?? '', maxChars, 'utf-8')
         const err = shape(native.stderr ?? '', maxChars, 'utf-8')
         if (logFile) {
@@ -522,7 +649,21 @@ export function runCommand(request, signal) {
           : {}),
       })
     })
-  })
+    })
+
+  if (shell === 'powershell' || !detectPowerShell(command)) return execute(null)
+
+  // A native command runs in a worker, so a runaway regex or a huge listing
+  // can be terminated instead of freezing the host process.
+  return runNativeIsolated(command, cwd, Math.min(timeoutMs, NATIVE_TIMEOUT_MS), signal)
+    .then((native) => {
+      if (!native) return execute(null)
+      if (native.aborted) return nativeAbortedResult(startedAt)
+      if (native.timedOut) return nativeTimedOutResult(startedAt)
+      if (native.error) return execute(null)
+      return execute(native)
+    })
+    .catch(() => execute(null))
 }
 
 /**

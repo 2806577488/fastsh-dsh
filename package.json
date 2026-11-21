@@ -1,6 +1,6 @@
 {
   "name": "dsh-fastsh",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "Fast, encoding-safe Windows command execution for DSH: cmd.exe plus a native PowerShell subset, replacing the pwsh tool.",
   "license": "MIT",
   "type": "module",

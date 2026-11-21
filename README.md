@@ -212,6 +212,16 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 
 `shell: "cmd"` / `shell: "powershell"` 可以强制覆盖猜测。
 
+## 执行隔离
+
+原生引擎跑在独立的 **worker 线程**里，不在宿主线程上执行：
+
+- 一次递归列目录（实测 4.2 秒）不会再冻结 DSH；事件循环最大阻塞从 374 ms 降到 **18.7 ms**；
+- 原生调用超时（`min(timeoutMs, 60s)`）会直接 `terminate` worker，然后由下一次调用重建；
+- 因此 `Select-String -Pattern '(a+)+$'` 这类灾难性回溯只会杀掉 worker，返回 `timedOut`，宿主仍然响应。
+
+原生调用按顺序串行化，避免多个请求互相卡住；worker 用 `unref()`，不会阻止进程退出。
+
 ## 已验证
 
 在 `test/ps.test.mjs`（40 项）、`test/exec.test.mjs`（28 项）、
