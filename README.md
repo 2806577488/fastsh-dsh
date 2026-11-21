@@ -225,6 +225,7 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 ### 性能
 
 - `Get-ChildItem -Name` 不再对每个条目 `statSync`，只读目录项：System32（约 5000 项）**1099 ms → 46 ms**。
+- 递归查找跟随 junction / 符号链接目录（带环检测），过滤正则只编译一次，递归时跳过每层排序；在 DSH NEXT 树（约 2100 项）找 `*.exe`：**1277 ms → 231 ms**，比 `dir /s /b`（383 ms）快，约为真实 PowerShell（2496 ms）的 1/10。加 `| Select-Object -First 1` 命中即停，**1 ms**。
 - `Select-String` 按 1 MB 分块流式读，不再整体读入再 split：10 MB / 20 万匹配 **113 ms → 45 ms**，内存不再按文件大小翻倍。
 - `Get-Content -Tail N` 只读文件末尾窗口，`-TotalCount N` 读够就停。
 - 全量 `Get-Content`（不带 `-Raw/-Tail/-TotalCount`）仍会把内容整体读入内存——这是"返回全部行"的固有成本，但它发生在 worker 里，宿主不受影响。

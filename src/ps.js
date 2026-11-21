@@ -19,6 +19,7 @@ import {
   readdirSync,
   readFileSync,
   readSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -174,42 +175,70 @@ function shapeItem(path) {
   }
 }
 
-function listChildren(path, { recurse, depth, filter, filesOnly, dirsOnly, nameOnly }) {
+function listChildren(path, { recurse, depth, filterRegex, filesOnly, dirsOnly, nameOnly, limit }) {
   const sortLevel = (entries) =>
     entries.sort((a, b) => {
       if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1
       return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
     })
 
+  // PowerShell follows junctions and symlinked directories. Only links need a
+  // real-path check: a plain directory tree cannot cycle, and resolving every
+  // directory made a recursive search several times slower than needed.
+  const visited = new Set([realpathSync(path)])
+  const enterLink = (dir) => {
+    try {
+      const real = realpathSync(dir)
+      if (visited.has(real)) return false
+      visited.add(real)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   const collect = (dir) => {
     const out = []
-    for (const entry of sortLevel(readdirSync(dir, { withFileTypes: true }))) {
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return out
+    }
+    // Sorting only matters for a single-level listing; a recursive search
+    // would only pay the cost without anyone seeing the order.
+    if (!recurse) entries = sortLevel(entries)
+    for (const entry of entries) {
       const full = join(dir, entry.name)
-      const isDir = entry.isDirectory()
-      if (!(filesOnly && isDir) && !(dirsOnly && !isDir) && !(filter && !matchesFilter(entry.name, filter))) {
-        // -Name only needs the directory entry; stat-ing every child made a
-        // 5000-entry listing take a second instead of milliseconds.
-        out.push(
-          nameOnly
-            ? { Name: entry.name, FullName: full, PSIsContainer: isDir }
-            : shapeItem(full),
-        )
+      let isDir = entry.isDirectory()
+      if (!isDir && entry.isSymbolicLink()) {
+        try {
+          isDir = statSync(full).isDirectory()
+        } catch {
+          isDir = false
+        }
       }
-      if (isDir) out.push({ __dir: full })
+      const matched = !filterRegex || filterRegex.test(entry.name)
+      if (matched && !(filesOnly && isDir) && !(dirsOnly && !isDir)) {
+        out.push(nameOnly ? { Name: entry.name, FullName: full, PSIsContainer: isDir } : shapeItem(full))
+        if (limit && out.length >= limit) return out
+      }
+      if (isDir) out.push({ __dir: full, __link: entry.isSymbolicLink() })
     }
     return out
   }
 
-  // -Depth N: breadth-first, exactly like Get-ChildItem -Depth.
   if (depth !== undefined) {
-    let level = [path]
+    let level = [{ dir: path, link: false }]
     const out = []
     for (let current = 0; current <= depth && level.length > 0; current++) {
       const next = []
-      for (const dir of level) {
+      for (const { dir, link } of level) {
+        if (link && !enterLink(dir)) continue
         for (const item of collect(dir)) {
-          if (item.__dir) next.push(item.__dir)
+          if (item.__dir) next.push({ dir: item.__dir, link: item.__link })
           else out.push(item)
+          if (limit && out.length >= limit) return out
         }
       }
       level = next
@@ -217,16 +246,20 @@ function listChildren(path, { recurse, depth, filter, filesOnly, dirsOnly, nameO
     return out
   }
 
+  if (!recurse) return collect(path).filter((item) => !item.__dir)
+
+  const out = []
   const walk = (dir) => {
-    const out = []
     for (const item of collect(dir)) {
+      if (limit && out.length >= limit) return
       if (item.__dir) {
-        if (recurse) out.push(...walk(item.__dir))
+        if (item.__link && !enterLink(item.__dir)) continue
+        walk(item.__dir)
       } else out.push(item)
     }
-    return out
   }
-  return walk(path)
+  walk(path)
+  return out
 }
 
 /** Stream a file line by line without loading it whole; return false to stop. */
@@ -288,8 +321,16 @@ function readTailLines(path, count) {
   }
 }
 
-function matchesFilter(name, filter) {  const escaped = String(filter).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')
-  return new RegExp(`^${escaped}$`, 'i').test(name)
+function makeFilter(filter) {
+  const escaped = String(filter)
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.')
+  return new RegExp(`^${escaped}$`, 'i')
+}
+
+function matchesFilter(name, filter) {
+  return makeFilter(filter).test(name)
 }
 
 function valueOf(token, context) {
@@ -383,10 +424,11 @@ function runCmdlet(stage, input, context) {
       const items = listChildren(path, {
         recurse: truthy(params.get('recurse')),
         depth: Number.isFinite(depth) ? depth : undefined,
-        filter: filter ? valueOf(filter, context) : undefined,
+        filterRegex: filter ? makeFilter(valueOf(filter, context)) : undefined,
         filesOnly: truthy(params.get('file')),
         dirsOnly: truthy(params.get('directory')),
         nameOnly,
+        limit: context.earlyLimit,
       })
       // -Name prints the path relative to the listed directory, as PowerShell does.
       return nameOnly ? items.map((item) => relative(path, item.FullName)) : items
@@ -1127,19 +1169,32 @@ function runPipeline(command, context) {
 
   const stages = splitPipeline(single)
   if (stages.length === 0) nope('empty pipeline')
-  let values
-  let index = 0
-  // A pipeline may start from a variable: `$items | Select-Object -First 1`.
-  if (stages.length > 1 && /^\$[A-Za-z_][\w:]*(?:\.[A-Za-z_]\w*)*$/.test(stages[0].trim())) {
-    values = resolveReference(stages[0].trim(), context)
-    index = 1
+  // `Get-ChildItem ... | Select-Object -First N` stops enumerating once N items
+  // are found, the way PowerShell's lazy pipeline does, instead of walking the
+  // whole tree first.
+  let earlyLimit
+  if (stages.length === 2 && /^get-childitem\b/i.test(stages[0].trim())) {
+    const first = stages[1].match(/\s-first\s+(\d+)/i)
+    if (first) earlyLimit = Number(first[1])
   }
-  for (; index < stages.length; index++) {
-    const parsed = parseStage(stages[index])
-    values = runCmdlet(parsed, values, context)
-    if (values === undefined) nope('undefined result')
+  if (earlyLimit) context.earlyLimit = earlyLimit
+  try {
+    let values
+    let index = 0
+    // A pipeline may start from a variable: `$items | Select-Object -First 1`.
+    if (stages.length > 1 && /^\$[A-Za-z_][\w:]*(?:\.[A-Za-z_]\w*)*$/.test(stages[0].trim())) {
+      values = resolveReference(stages[0].trim(), context)
+      index = 1
+    }
+    for (; index < stages.length; index++) {
+      const parsed = parseStage(stages[index])
+      values = runCmdlet(parsed, values, context)
+      if (values === undefined) nope('undefined result')
+    }
+    return values
+  } finally {
+    if (earlyLimit) delete context.earlyLimit
   }
-  return values
 }
 
 function parseCallOperator(text, context) {

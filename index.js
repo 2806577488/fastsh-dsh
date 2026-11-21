@@ -13,7 +13,7 @@ export const name = 'fastsh'
 /** The tool registry is the only hard dependency. */
 export const inject = ['tools']
 
-const PROMPT_SECTION = `All Windows shell commands MUST run through the \`fastsh\` tool. The \`pwsh\` tool is disabled in this profile: calling it is an error. Plain commands run on cmd.exe; common PowerShell (Get-ChildItem, Get-Content, Test-Path, Select/Where/ForEach/Sort/Measure-Object, $env:, [System.IO.File]::) runs natively in milliseconds, and anything outside that subset falls back to Windows PowerShell. Any command that may run longer than about 30 seconds — builds, package installs, test suites, downloads, emulator runs, migrations — MUST pass run_in_background: true and leave conclude_turn at its default. That returns a job id and ends the turn; never run such a command in the foreground and never raise timeoutMs to cover it. DSH notifies you when the job settles, so do not poll job_output while it runs.`
+const PROMPT_SECTION = `All Windows shell commands MUST run through the \`fastsh\` tool. The \`pwsh\` tool is disabled in this profile: calling it is an error. Plain commands run on cmd.exe; common PowerShell (Get-ChildItem, Get-Content, Test-Path, Select/Where/ForEach/Sort/Measure-Object, $env:, [System.IO.File]::) runs natively in milliseconds, and anything outside that subset falls back to Windows PowerShell. Any command that may run longer than about 30 seconds — builds, package installs, test suites, downloads, emulator runs, migrations — MUST pass run_in_background: true and leave conclude_turn at its default. That returns a job id and ends the turn; never run such a command in the foreground and never raise timeoutMs to cover it. DSH notifies you when the job settles, so do not poll job_output while it runs. To find a file across a tree, use \`Get-ChildItem <dir> -Recurse -Filter <name> -Name\`; append \`| Select-Object -First 1\` when any match will do, because it stops the walk as soon as one is found.`
 
 /** PowerShell tool this plugin replaces. */
 const REPLACED_TOOL = 'pwsh'
@@ -171,6 +171,7 @@ function tryStartJob(ctx, request, input, exec) {
       owner: exec?.agent?.id,
       toolCall: callId ? { callId, rootCallId: exec.rootCallId ?? callId } : undefined,
       outputLimitBytes: clampOutputLimit(input.outputLimitBytes),
+      logFile: request.logFile,
     })
   } catch {
     // The jobs service refuses work when no attached controller serves the owner.
