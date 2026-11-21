@@ -10,12 +10,15 @@
 import { execFileSync } from 'node:child_process'
 import {
   appendFileSync,
+  closeSync,
   cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   renameSync,
   rmSync,
   statSync,
@@ -171,7 +174,7 @@ function shapeItem(path) {
   }
 }
 
-function listChildren(path, { recurse, depth, filter, filesOnly, dirsOnly }) {
+function listChildren(path, { recurse, depth, filter, filesOnly, dirsOnly, nameOnly }) {
   const sortLevel = (entries) =>
     entries.sort((a, b) => {
       if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1
@@ -184,7 +187,13 @@ function listChildren(path, { recurse, depth, filter, filesOnly, dirsOnly }) {
       const full = join(dir, entry.name)
       const isDir = entry.isDirectory()
       if (!(filesOnly && isDir) && !(dirsOnly && !isDir) && !(filter && !matchesFilter(entry.name, filter))) {
-        out.push(shapeItem(full))
+        // -Name only needs the directory entry; stat-ing every child made a
+        // 5000-entry listing take a second instead of milliseconds.
+        out.push(
+          nameOnly
+            ? { Name: entry.name, FullName: full, PSIsContainer: isDir }
+            : shapeItem(full),
+        )
       }
       if (isDir) out.push({ __dir: full })
     }
@@ -220,8 +229,66 @@ function listChildren(path, { recurse, depth, filter, filesOnly, dirsOnly }) {
   return walk(path)
 }
 
-function matchesFilter(name, filter) {
-  const escaped = String(filter).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')
+/** Stream a file line by line without loading it whole; return false to stop. */
+function forEachLine(path, onLine) {
+  const fd = openSync(path, 'r')
+  const decoder = new TextDecoder('utf-8')
+  const buffer = Buffer.alloc(1024 * 1024)
+  let carry = ''
+  let lineNumber = 0
+  try {
+    for (;;) {
+      const bytes = readSync(fd, buffer, 0, buffer.length, null)
+      if (bytes === 0) break
+      const text = carry + decoder.decode(buffer.subarray(0, bytes), { stream: true })
+      let start = 0
+      for (let i = 0; i < text.length; i++) {
+        if (text.charCodeAt(i) !== 10) continue
+        let line = text.slice(start, i)
+        if (line.endsWith('\r')) line = line.slice(0, -1)
+        lineNumber += 1
+        if (onLine(line, lineNumber) === false) return lineNumber
+        start = i + 1
+      }
+      carry = text.slice(start)
+      // A single pathological line must not grow without bound.
+      if (carry.length > 8 * 1024 * 1024) {
+        lineNumber += 1
+        if (onLine(carry, lineNumber) === false) return lineNumber
+        carry = ''
+      }
+    }
+    const rest = carry + decoder.decode()
+    if (rest !== '') {
+      lineNumber += 1
+      onLine(rest, lineNumber)
+    }
+  } finally {
+    closeSync(fd)
+  }
+  return lineNumber
+}
+
+/** Last N lines of a file, reading only a bounded window from the end. */
+function readTailLines(path, count) {
+  if (count <= 0) return []
+  const stats = statSync(path)
+  const windowSize = Math.min(stats.size, Math.max(1024 * 1024, count * 256))
+  const fd = openSync(path, 'r')
+  try {
+    const buffer = Buffer.alloc(windowSize)
+    readSync(fd, buffer, 0, windowSize, stats.size - windowSize)
+    let lines = new TextDecoder('utf-8').decode(buffer).split(/\r?\n/)
+    if (lines.length && lines[lines.length - 1] === '') lines.pop()
+    // The window usually starts mid-line; drop that partial first line.
+    if (windowSize < stats.size) lines = lines.slice(1)
+    return lines.slice(-count)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function matchesFilter(name, filter) {  const escaped = String(filter).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')
   return new RegExp(`^${escaped}$`, 'i').test(name)
 }
 
@@ -312,15 +379,17 @@ function runCmdlet(stage, input, context) {
       const depthParam = param(params, 'depth')
       const depth =
         depthParam === undefined || depthParam === true ? undefined : Number(String(valueOf(depthParam, context)))
+      const nameOnly = truthy(params.get('name'))
       const items = listChildren(path, {
         recurse: truthy(params.get('recurse')),
         depth: Number.isFinite(depth) ? depth : undefined,
         filter: filter ? valueOf(filter, context) : undefined,
         filesOnly: truthy(params.get('file')),
         dirsOnly: truthy(params.get('directory')),
+        nameOnly,
       })
       // -Name prints the path relative to the listed directory, as PowerShell does.
-      return truthy(params.get('name')) ? items.map((item) => relative(path, item.FullName)) : items
+      return nameOnly ? items.map((item) => relative(path, item.FullName)) : items
     }
     case 'get-item':
     case 'gi': {
@@ -340,14 +409,27 @@ function runCmdlet(stage, input, context) {
     case 'cat':
     case 'type': {
       const path = toPath(param(params, 'path') ?? args[0], context)
-      const raw = readFileSync(path, 'utf8')
-      if (truthy(params.get('raw'))) return raw
-      const lines = raw.split(/\r?\n/)
-      if (lines.length && lines[lines.length - 1] === '') lines.pop()
+      if (truthy(params.get('raw'))) return readFileSync(path, 'utf8')
+
       const tail = param(params, 'tail')
-      if (tail !== undefined) return lines.slice(-Number(valueOf(tail, context)))
+      if (tail !== undefined) return readTailLines(path, Number(valueOf(tail, context)) || 0)
+
       const first = param(params, 'totalcount') ?? param(params, 'head')
-      if (first !== undefined) return lines.slice(0, Number(valueOf(first, context)))
+      if (first !== undefined) {
+        const count = Number(valueOf(first, context)) || 0
+        const lines = []
+        // Only read until the requested count is satisfied.
+        forEachLine(path, (line) => {
+          lines.push(line)
+          return lines.length >= count ? false : undefined
+        })
+        return lines
+      }
+
+      const lines = []
+      forEachLine(path, (line) => {
+        lines.push(line)
+      })
       return lines
     }
     case 'set-content':
@@ -461,11 +543,10 @@ function runCmdlet(stage, input, context) {
       const pathArg = param(params, 'path') ?? args[1]
       if (pathArg === undefined) nope('select-string without path')
       const display = String(valueOf(pathArg, context))
-      const lines = readFileSync(toPath(display, context), 'utf8').split(/\r?\n/)
       const out = []
-      for (let i = 0; i < lines.length; i++) {
-        if (accept(lines[i])) out.push(`${display}:${i + 1}:${lines[i]}`)
-      }
+      forEachLine(toPath(display, context), (line, lineNumber) => {
+        if (accept(line)) out.push(`${display}:${lineNumber}:${line}`)
+      })
       return out
     }
     case 'tee-object': {

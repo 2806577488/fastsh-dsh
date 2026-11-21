@@ -222,6 +222,13 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 
 原生调用按顺序串行化，避免多个请求互相卡住；worker 用 `unref()`，不会阻止进程退出。
 
+### 性能
+
+- `Get-ChildItem -Name` 不再对每个条目 `statSync`，只读目录项：System32（约 5000 项）**1099 ms → 46 ms**。
+- `Select-String` 按 1 MB 分块流式读，不再整体读入再 split：10 MB / 20 万匹配 **113 ms → 45 ms**，内存不再按文件大小翻倍。
+- `Get-Content -Tail N` 只读文件末尾窗口，`-TotalCount N` 读够就停。
+- 全量 `Get-Content`（不带 `-Raw/-Tail/-TotalCount`）仍会把内容整体读入内存——这是"返回全部行"的固有成本，但它发生在 worker 里，宿主不受影响。
+
 ## 已验证
 
 在 `test/ps.test.mjs`（40 项）、`test/exec.test.mjs`（28 项）、
