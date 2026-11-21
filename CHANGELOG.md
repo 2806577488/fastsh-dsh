@@ -1,5 +1,10 @@
 # 更新记录
 
+## v1.8.5
+
+- 仓库补齐 `test/perf.test.mjs` 与 `test/lurk.cjs`：此前只存在于本地，clone 下来跑不了完整测试与性能守卫。
+- 同版本发布交付包 `fastsh-1.8.5-kit.zip`（插件源码 + 仓库快照 + 离线安装包 + 文档），附在 GitHub Release 里。
+
 ## v1.8.4
 
 - 提示词明确内容搜索走内置 `grep`（ripgrep），不要用 `Select-String` 或 `Get-ChildItem -Recurse | Select-String`（慢路径）；`Select-String` 只用于过滤命令自身的输出。
