@@ -27,6 +27,7 @@ fastsh 已贴着地板；剩下的差距全部来自 PowerShell 引擎的初始�
 | `workdir` | 工作目录，默认会话工作区 |
 | `timeoutMs` | 默认 120000，限制 1000–600000；超时杀整棵进程树 |
 | `maxOutputChars` | 每路输出默认保留 200000 字符，超出保留头尾并落盘完整文本 |
+| `logFile` | 完整原始输出落盘路径（UTF-8，stdout+stderr），不受 job 环形缓冲裁剪 |
 | `run_in_background` | 作为 DSH job 启动，立即返回 job id；用 `job_output` 读、`job_kill` 停 |
 | `outputLimitBytes` | 仅后台任务：job 保留多少字节输出（限制 16 KiB–16 MiB） |
 | `conclude_turn` | 仅后台任务，默认 `true`：启动后立刻结束本轮，不等进程 |
@@ -93,6 +94,18 @@ jobs 服务有两条上限：运行期 `retainBytes`（默认 256 KiB）和结�
 它只对 `run_in_background` 生效；前台命令仍然用 `maxOutputChars` + 完整落盘
 文件那套。
 
+### logFile
+
+`logFile` 把一个路径交给 fastsh，子进程的**原始字节**会边跑边写进这个文件
+（stdout 与 stderr 按真实顺序合并，UTF-8 无 BOM），同时照常回显和进 job 环形缓冲。
+
+这让长构建不再依赖 `Tee-Object`：job 环形缓冲运行期只保留 256 KiB、结算后裁到
+16 KiB，而 `logFile` 保留完整记录。前台、后台、分离回退三种模式都支持。
+
+用 `Tee-Object` 也可以，但原生只管**原生管道**的输入；`flutter ... | Tee-Object`
+这种“外部程序 → 原生 cmdlet”的管道仍然回退 PowerShell——所以长任务优先用
+`logFile`。
+
 ### conclude_turn
 
 后台任务默认在启动后**立刻结束本轮**（调用 `exec.concludeTurn()`），这样模型不会
@@ -152,7 +165,7 @@ permission (@deepseek-ai/dsh-permission-presets): pending (waiting for service: 
 | 文件 | `Get-ChildItem`（`-Name/-File/-Directory/-Recurse/-Filter`）、`Get-Item`、`Get-Content`（`-Raw/-TotalCount/-Tail`）、`Set-Content`、`Add-Content`、`New-Item`、`Remove-Item`、`Copy-Item`、`Move-Item`、`Test-Path`、`Join-Path`、`Split-Path`、`Get-Location` |
 | 管道 | `Select-Object`（`-First/-Last/-Skip/-Property/-ExpandProperty`）、`Where-Object`（属性比较）、`ForEach-Object`（属性取值）、`Sort-Object`、`Measure-Object` |
 | 进程与时间 | `Get-Process`（`-Name/-Id`，走 tasklist，约 0.3 s）、`Get-Date`（`-Format` 支持 .NET 格式串） |
-| 文本与序列化 | `Select-String`（`-Path/-Pattern/-SimpleMatch/-CaseSensitive/-NotMatch`，输出 `路径:行号:内容`）、`Out-File`（`-Encoding/-Append`）、`ConvertTo-Json`（`-Compress`） |
+| 文本与序列化 | `Select-String`（`-Path/-Pattern/-SimpleMatch/-CaseSensitive/-NotMatch`，输出 `路径:行号:内容`）、`Out-File`（`-Encoding/-Append`）、`Tee-Object`（`-FilePath/-Append`，透传）、`ConvertTo-Json`（`-Compress`） |
 | .NET 静态调用 | `[System.IO.File]::`（Exists/ReadAllText/ReadAllLines/WriteAllText/AppendAllText/Delete/Copy/Move）、`[System.IO.Directory]::`、`[System.IO.Path]::`、`[Environment]::`、`[math]::`、`[Guid]::NewGuid`、`[DateTime]::Now/UtcNow/Today/Parse` |
 | 变量 | 赋值 `$x = ...`、引用 `$x`、属性链 `$x.Name`、`$env:NAME`、`$PWD`、`$HOME`、`$null`、`$true/$false`、`$_` |
 | 控制流 | `if / elseif / else`、`foreach ($x in ...)`、`try / catch / finally`、`;` 与换行语句分隔、`$(...)` 子表达式、反引号续行 |

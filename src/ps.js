@@ -468,6 +468,16 @@ function runCmdlet(stage, input, context) {
       }
       return out
     }
+    case 'tee-object': {
+      const target = param(params, 'filepath') ?? param(params, 'path') ?? args[0]
+      if (target === undefined) nope('tee-object without a path')
+      const filePath = toPath(String(valueOf(target, context)), context)
+      const values = input === undefined ? [] : Array.isArray(input) ? input : [input]
+      const text = values.map((value) => renderValue(value)).join('\n')
+      if (truthy(params.get('append'))) appendFileSync(filePath, `${text}\n`, 'utf8')
+      else writeFileSync(filePath, `${text}\n`, 'utf8')
+      return values
+    }
     case 'out-file': {
       const target = param(params, 'filepath') ?? param(params, 'path') ?? args[0]
       if (target === undefined) nope('out-file without a path')

@@ -46,6 +46,11 @@ const PARAMETERS = {
       description:
         'Maximum characters kept per stream before the middle is trimmed, default 200000. The complete decoded text is then written to a UTF-8 file reported as fullOutputPath.',
     },
+    logFile: {
+      type: 'string',
+      description:
+        'Path that receives the command\'s complete raw output (stdout and stderr, byte-faithful, UTF-8). Unlike job_output, which is a bounded ring buffer, this file keeps the whole transcript of a long build. Parent directories are created and an existing file is overwritten.',
+    },
     run_in_background: {
       type: 'boolean',
       description:
@@ -91,6 +96,7 @@ const OUTPUT_SCHEMA = {
     stderrEncoding: { type: 'string', description: 'Encoding actually used for stderr.' },
     truncated: { type: 'boolean', description: 'True when output was trimmed or a byte cap was reached.' },
     fullOutputPath: { type: 'string', description: 'UTF-8 file holding the complete decoded output when it was trimmed.' },
+    logPath: { type: 'string', description: 'The logFile that received the complete raw output.' },
     background: { type: 'boolean', description: 'True for a run_in_background call.' },
     jobId: { type: 'string', description: 'DSH job id for a background run; pass it to job_output or job_kill.' },
     pid: { type: 'integer', description: 'Detached process id when no jobs service was available.' },
@@ -126,6 +132,7 @@ function renderText(value) {
           `stderr: ${v.stderrPath ?? 'unavailable'}`,
         ]
     if (v.concluded) lines.push('this turn ends here; DSH notifies you when the job settles')
+    if (v.logPath) lines.push(`log: ${v.logPath}`)
     return lines.join('\n')
   }
 
@@ -140,6 +147,7 @@ function renderText(value) {
   const stderr = typeof v.stderr === 'string' ? v.stderr.replace(/\s+$/, '') : ''
   if (stderr) parts.push(`stderr:\n${stderr}`)
   if (v.truncated) parts.push('[output truncated to the tail]')
+  if (v.logPath) parts.push(`log: ${v.logPath}`)
   if (v.fullOutputPath) parts.push(`full output: ${v.fullOutputPath}`)
   return parts.join('\n')
 }
@@ -222,6 +230,8 @@ function createDefinition(ctx) {
         cwd,
         shell: input.shell === 'powershell' || input.shell === 'cmd' ? input.shell : 'auto',
         encoding: typeof input.encoding === 'string' ? input.encoding : 'auto',
+        logFile:
+          typeof input.logFile === 'string' && input.logFile.trim() ? input.logFile.trim() : undefined,
       }
 
       if (input.run_in_background === true) {

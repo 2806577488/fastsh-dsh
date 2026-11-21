@@ -13,9 +13,9 @@
 
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { closeSync, mkdirSync, openSync, writeFileSync } from 'node:fs'
+import { closeSync, mkdirSync, openSync, writeFileSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { runNativePowerShell } from './ps.js'
 
 export const DEFAULT_TIMEOUT_MS = 120_000
@@ -273,7 +273,7 @@ function shape(text, maxChars, encoding) {
  * @param {AbortSignal} [signal]
  */
 export function runCommand(request, signal) {
-  const { command, cwd, shell = 'auto', encoding = 'auto' } = request
+  const { command, cwd, shell = 'auto', encoding = 'auto', logFile } = request
   const timeoutMs = clampTimeout(request.timeoutMs)
   const maxChars = clampMaxChars(request.maxChars)
 
@@ -309,6 +309,14 @@ export function runCommand(request, signal) {
       } else if (native) {
         const out = shape(native.stdout ?? '', maxChars, 'utf-8')
         const err = shape(native.stderr ?? '', maxChars, 'utf-8')
+        if (logFile) {
+          try {
+            mkdirSync(dirname(logFile), { recursive: true })
+            writeFileSync(logFile, `${native.stdout ?? ''}${native.stderr ?? ''}`, 'utf8')
+          } catch {
+            /* the result still reports the text */
+          }
+        }
         resolve({
           exitCode: native.exitCode ?? 0,
           signal: null,
@@ -320,10 +328,45 @@ export function runCommand(request, signal) {
           stdoutEncoding: 'utf-8',
           stderrEncoding: 'utf-8',
           truncated: out.truncated || err.truncated,
+          ...(logFile ? { logPath: logFile } : {}),
           ...(out.fullOutputPath ? { fullOutputPath: out.fullOutputPath } : {}),
         })
         return
       }
+    }
+
+    // Raw child bytes also go to the caller's log file, so a long run keeps a
+    // complete transcript even when the job ring has to drop old output.
+    let logFd = null
+    if (logFile) {
+      try {
+        mkdirSync(dirname(logFile), { recursive: true })
+        logFd = openSync(logFile, 'w')
+      } catch (error) {
+        resolve({
+          error: `cannot open logFile ${logFile}: ${error?.message ?? error}`,
+          exitCode: null,
+          timedOut: false,
+          aborted: false,
+          durationMs: Date.now() - startedAt,
+          stdout: '',
+          stderr: '',
+          stdoutEncoding: 'none',
+          stderrEncoding: 'none',
+          truncated: false,
+        })
+        return
+      }
+    }
+
+    const closeLog = () => {
+      if (logFd === null) return
+      try {
+        closeSync(logFd)
+      } catch {
+        /* already closed */
+      }
+      logFd = null
     }
 
     const stdout = tailLimit()
@@ -365,6 +408,7 @@ export function runCommand(request, signal) {
       if (timer) clearTimeout(timer)
       if (forceTimer) clearTimeout(forceTimer)
       if (signal) signal.removeEventListener('abort', onAbort)
+      closeLog()
       resolve(payload)
     }
 
@@ -417,8 +461,26 @@ export function runCommand(request, signal) {
       requestKill()
     }, timeoutMs)
 
-    child.stdout.on('data', (chunk) => stdout.push(chunk))
-    child.stderr.on('data', (chunk) => stderr.push(chunk))
+    child.stdout.on('data', (chunk) => {
+      if (logFd !== null) {
+        try {
+          writeSync(logFd, chunk)
+        } catch {
+          /* a full disk must not abort the command */
+        }
+      }
+      stdout.push(chunk)
+    })
+    child.stderr.on('data', (chunk) => {
+      if (logFd !== null) {
+        try {
+          writeSync(logFd, chunk)
+        } catch {
+          /* ignore */
+        }
+      }
+      stderr.push(chunk)
+    })
 
     child.on('error', (error) => {
       finish({
@@ -453,6 +515,7 @@ export function runCommand(request, signal) {
         stdoutEncoding: shapedOut.encoding,
         stderrEncoding: shapedErr.encoding,
         truncated: out.truncated || err.truncated || shapedOut.truncated || shapedErr.truncated,
+        ...(logFile ? { logPath: logFile } : {}),
         ...(shapedOut.fullOutputPath ? { fullOutputPath: shapedOut.fullOutputPath } : {}),
         ...(shapedErr.fullOutputPath && !shapedOut.fullOutputPath
           ? { fullOutputPath: shapedErr.fullOutputPath }
@@ -467,13 +530,14 @@ export function runCommand(request, signal) {
  * The caller gets the pid and the paths, so the run survives this turn.
  */
 export function runInBackground(request) {
-  const { command, cwd, shell = 'auto' } = request
+  const { command, cwd, shell = 'auto', logFile } = request
   const { file, args, options } = shellCommand(command, shell)
   const dir = join(tmpdir(), 'dsh-fastsh')
   mkdirSync(dir, { recursive: true })
   const id = randomUUID().slice(0, 8)
-  const stdoutPath = join(dir, `${id}.out.log`)
-  const stderrPath = join(dir, `${id}.err.log`)
+  const stdoutPath = logFile ?? join(dir, `${id}.out.log`)
+  const stderrPath = logFile ? `${logFile}.err` : join(dir, `${id}.err.log`)
+  if (logFile) mkdirSync(dirname(logFile), { recursive: true })
 
   const out = openSync(stdoutPath, 'w')
   const err = openSync(stderrPath, 'w')
@@ -616,7 +680,7 @@ export function createStreamDecoder(forced = 'auto') {
  * @returns {string} the registry-issued job id
  */
 export function startBackgroundJob(request) {
-  const { jobs, command, cwd, shell = 'auto', encoding = 'auto', label, owner, toolCall } = request
+  const { jobs, command, cwd, shell = 'auto', encoding = 'auto', label, owner, toolCall, logFile } = request
   const outputLimitBytes = clampOutputLimit(request.outputLimitBytes)
   const spec = {
     kind: 'bash',
@@ -628,6 +692,34 @@ export function startBackgroundJob(request) {
       const { file, args, options } = shellCommand(command, shell)
       const out = createStreamDecoder(encoding)
       const err = createStreamDecoder(encoding)
+
+      // The job ring is bounded, so the raw transcript also goes to a file.
+      let logFd = null
+      if (logFile) {
+        try {
+          mkdirSync(dirname(logFile), { recursive: true })
+          logFd = openSync(logFile, 'w')
+        } catch {
+          logFd = null
+        }
+      }
+      const writeLog = (chunk) => {
+        if (logFd === null) return
+        try {
+          writeSync(logFd, chunk)
+        } catch {
+          /* ignore */
+        }
+      }
+      const closeLog = () => {
+        if (logFd === null) return
+        try {
+          closeSync(logFd)
+        } catch {
+          /* already closed */
+        }
+        logFd = null
+      }
 
       let child = null
       let killReason = null
@@ -663,21 +755,25 @@ export function startBackgroundJob(request) {
       }
 
       child.stdout.on('data', (chunk) => {
+        writeLog(chunk)
         const text = out.push(chunk)
         if (text) job.append(text, { channel: 'stdout' })
       })
       child.stderr.on('data', (chunk) => {
+        writeLog(chunk)
         const text = err.push(chunk)
         if (text) job.append(text, { channel: 'stderr' })
       })
 
       child.on('error', (error) => {
         drainDecoders()
+        closeLog()
         settle('failed', error?.message ?? String(error))
       })
 
       child.on('close', (exitCode) => {
         drainDecoders()
+        closeLog()
         // The registry merges the caller's kill reason into `detail`; do not
         // repeat it here.
         if (killReason !== null) settle('killed')
