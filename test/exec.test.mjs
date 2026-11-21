@@ -1,6 +1,9 @@
 import { runCommand, runInBackground, decodeOutput, detectPowerShell } from '../src/exec.js'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+
+// Fixtures are addressed from the package root.
+process.chdir(fileURLToPath(new URL('..', import.meta.url)))
 
 /** Sleep command that starts no PING.EXE. */
 const SLEEP = `"${process.execPath}" "${fileURLToPath(new URL('./sleep.cjs', import.meta.url))}"`
@@ -28,6 +31,43 @@ function check(name, ok, detail) {
 {
   const r = await runCommand({ command: 'echo one\necho two', cwd: 'C:\\Windows' })
   check('multi-line command', r.stdout.includes('one') && r.stdout.includes('two'), JSON.stringify(r.stdout))
+}
+
+// 2c. `&&` belongs to cmd and must run both sides
+{
+  const r = await runCommand({ command: 'echo one && echo two', cwd: 'C:\\Windows' })
+  check('cmd && chaining', r.stdout.includes('one') && r.stdout.includes('two'), JSON.stringify(r.stdout))
+}
+
+// 2d. logFile keeps the raw transcript
+{
+  const log = 'test/tmp-log.txt'
+  rmSync(log, { force: true })
+  const r = await runCommand({ command: 'echo hello-log & echo err-log 1>&2', cwd: 'C:\\Windows', logFile: log })
+  const written = existsSync(log) ? readFileSync(log, 'utf8') : ''
+  check(
+    'logFile raw output',
+    r.logPath === log && written.includes('hello-log') && written.includes('err-log'),
+    JSON.stringify(written.slice(0, 40)),
+  )
+  rmSync(log, { force: true })
+}
+
+// 2e. a catastrophic regex is terminated instead of freezing the process
+{
+  const target = 'test/tmp-redos.txt'
+  writeFileSync(target, `${'a'.repeat(20000)}!\n`, 'utf8')
+  const started = Date.now()
+  const r = await runCommand({
+    command: `Select-String -Path "${target}" -Pattern '(a+)+$'`,
+    cwd: process.cwd(),
+    timeoutMs: 1500,
+  })
+  const elapsed = Date.now() - started
+  check('native timeout kills worker', r.timedOut === true && elapsed < 8000, `${elapsed}ms`)
+  const after = await runCommand({ command: 'Get-Location', cwd: process.cwd() })
+  check('native works after worker restart', typeof after.stdout === 'string' && after.stdout.length > 0, after.stdout)
+  rmSync(target, { force: true })
 }
 
 // 3. stderr
@@ -95,6 +135,7 @@ function check(name, ok, detail) {
     '[System.IO.File]::Exists("x")',
     'Select-Object -First 1',
     'ForEach-Object { $_ }',
+    '& where.exe cmd',
   ]
   const cmd = [
     'dir /b',
@@ -103,6 +144,9 @@ function check(name, ok, detail) {
     'git status',
     'copy a b',
     'where.exe node',
+    'echo a && echo b',
+    'Get-ChildItem fastsh && echo done',
+    'echo a & echo b',
   ]
   for (const c of powershell) check(`detect PS: ${c.slice(0, 26)}`, detectPowerShell(c) === true, String(detectPowerShell(c)))
   for (const c of cmd) check(`detect cmd: ${c.slice(0, 26)}`, detectPowerShell(c) === false, String(detectPowerShell(c)))

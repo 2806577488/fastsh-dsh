@@ -1,5 +1,9 @@
 # 更新记录
 
+## v1.8.6
+
+- 测试可在克隆目录直接运行：不再依赖工作区路径（`fastsh/...`），一律相对包根，夹具放 `test/tmp-*`。`git clone && npm test` 现在能过。
+
 ## v1.8.5
 
 - 仓库补齐 `test/perf.test.mjs` 与 `test/lurk.cjs`：此前只存在于本地，clone 下来跑不了完整测试与性能守卫。

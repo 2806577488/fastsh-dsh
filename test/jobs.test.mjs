@@ -4,7 +4,12 @@
  * checked without a live DSH.
  */
 import { startBackgroundJob, createStreamDecoder, clampOutputLimit } from '../src/exec.js'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+
+// Fixtures are addressed from the package root.
+process.chdir(fileURLToPath(new URL('..', import.meta.url)))
 
 /** Sleep command that starts no PING.EXE. */
 const SLEEP = `"${process.execPath}" "${fileURLToPath(new URL('./sleep.cjs', import.meta.url))}"`
@@ -144,8 +149,7 @@ const textOf = (appended) => appended.map((a) => a.text).join('')
   startBackgroundJob({ jobs: mock.jobs, command: 'echo x', cwd: 'C:\\Windows', outputLimitBytes: 300000 })
   await mock.settled
   check('outputLimitBytes forwarded', mock.lastSpec.outputLimitBytes === 300000, String(mock.lastSpec.outputLimitBytes))
-}
-{
+}{
   const mock = mockJobs()
   startBackgroundJob({ jobs: mock.jobs, command: 'echo x', cwd: 'C:\\Windows' })
   await mock.settled
@@ -155,6 +159,46 @@ const textOf = (appended) => appended.map((a) => a.text).join('')
   check('clamp floor', clampOutputLimit(1) === 16 * 1024, String(clampOutputLimit(1)))
   check('clamp ceiling', clampOutputLimit(1e12) === 16 * 1024 * 1024, String(clampOutputLimit(1e12)))
   check('clamp invalid', clampOutputLimit('nope') === undefined, String(clampOutputLimit('nope')))
+}
+
+// 9. logFile keeps the raw job transcript beyond the ring buffer
+{
+  const log = 'test/tmp-job-log.txt'
+  rmSync(log, { force: true })
+  const mock = mockJobs()
+  startBackgroundJob({ jobs: mock.jobs, command: 'echo job-log-line', cwd: 'C:\\Windows', logFile: log })
+  await mock.settled
+  const written = existsSync(log) ? readFileSync(log, 'utf8') : ''
+  check('job logFile', written.includes('job-log-line'), JSON.stringify(written.slice(0, 40)))
+  rmSync(log, { force: true })
+}
+
+// 10. a grandchild that keeps the pipes open must not keep the job "running"
+{
+  const pidFile = 'test/tmp-lurk.pid'
+  rmSync(pidFile, { force: true })
+  const startedAt = Date.now()
+  const mock = mockJobs()
+  startBackgroundJob({
+    jobs: mock.jobs,
+    command: `"${process.execPath}" "test/lurk.cjs" "${pidFile}"`,
+    cwd: process.cwd(),
+    shell: 'cmd',
+  })
+  const outcome = await mock.settled
+  const elapsed = Date.now() - startedAt
+  check(
+    'settles with lingering grandchild',
+    outcome.status === 'completed' && elapsed < 6000,
+    `${elapsed}ms ${outcome.status}`,
+  )
+  try {
+    const pid = existsSync(pidFile) ? readFileSync(pidFile, 'utf8').trim() : ''
+    if (pid) execFileSync('taskkill', ['/pid', pid, '/t', '/f'], { stdio: 'ignore' })
+  } catch {
+    /* already gone */
+  }
+  rmSync(pidFile, { force: true })
 }
 
 console.log('PASS:\n  ' + ok.join('\n  '))

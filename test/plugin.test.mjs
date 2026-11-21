@@ -6,6 +6,9 @@ import { apply } from '../index.js'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// Fixtures are addressed from the package root.
+process.chdir(fileURLToPath(new URL('..', import.meta.url)))
+
 /** Sleep command that starts no PING.EXE. */
 const SLEEP = `"${process.execPath}" "${fileURLToPath(new URL('./sleep.cjs', import.meta.url))}"`
 
