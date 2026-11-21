@@ -187,7 +187,9 @@ function createDefinition(ctx) {
       'Output is decoded as UTF-8 when the bytes are valid UTF-8 and as the system ANSI code page (GBK) otherwise, so Chinese output is not mojibake; redirected files are written by the program itself and never transcoded. ' +
       'With run_in_background it starts a DSH job, so job_output, job_list and job_kill all work on it. ' +
       'This profile has no other shell tool: pwsh is disabled, so every command must come here. ' +
-      'Plain commands run on cmd.exe; PowerShell-looking commands first run in a built-in Node subset (Get-ChildItem, Get-Content, Test-Path, Select/Where/ForEach/Sort/Measure-Object, [System.IO.File]::, $env:, ...), and anything outside that subset falls back to Windows PowerShell automatically.',
+      'Plain commands run on cmd.exe; PowerShell-looking commands first run in a built-in Node subset and only fall back to Windows PowerShell outside it. ' +
+      'Native subset: Get-ChildItem (-Name/-File/-Directory/-Recurse/-Filter/-Depth), Get-Item, Get-Content, Set/Add-Content, New-Item (incl. -ItemType Junction -Target), Remove/Copy/Move-Item, Test-Path (-PathType), Select-String, Out-File, Tee-Object, ConvertTo-Json, Get-Date (-Format), Get-Process, pipelines (Select/Where/ForEach/Sort/Measure-Object), variables $x=..., if/elseif/else, foreach, try/catch, $env:, $_, [System.IO.*]::, and the operators ; > >> 2> $(...) and & exe. ' +
+      'Background jobs always spawn a real cmd or PowerShell process, never the native subset. Prefer logFile over Tee-Object for full build logs, because job_output is a bounded ring.',
 
     parameters: PARAMETERS,
 
