@@ -162,6 +162,28 @@ function check(name, ok, detail) {
   check('auto keeps cmd for cmd syntax', r.stdout.trim() === 'C:\\Windows', r.stdout.trim())
 }
 
+// 13. a `powershell -Command "<script>"` launcher is peeled off instead of being
+// handed to cmd.exe, which cannot pass the inner quoting or newlines through.
+{
+  const r = await runCommand({ command: 'powershell -NoProfile -Command "Write-Output 你好"', cwd: 'C:\\Windows' })
+  check('launcher unwrapped', r.exitCode === 0 && r.stdout.trim() === '你好', JSON.stringify(r.stdout))
+}
+{
+  const r = await runCommand({
+    command: 'powershell -NoProfile -Command "Write-Output one\nWrite-Output two"',
+    cwd: 'C:\\Windows',
+  })
+  check('launcher keeps newlines', r.stdout.includes('one') && r.stdout.includes('two'), JSON.stringify(r.stdout))
+}
+{
+  const r = await runCommand({ command: 'powershell -Command "Write-Output 半截', cwd: 'C:\\Windows' })
+  check(
+    'unterminated launcher rejected',
+    typeof r.error === 'string' && r.error.includes('unterminated quote'),
+    String(r.error).slice(0, 60),
+  )
+}
+
 const failed = results.filter((r) => !r.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 process.exit(failed.length ? 1 : 0)

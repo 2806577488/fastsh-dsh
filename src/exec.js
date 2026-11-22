@@ -164,9 +164,66 @@ export function detectPowerShell(command) {
   return POWERSHELL_VERB.test(bare) || POWERSHELL_MARKER.test(bare)
 }
 
+/**
+ * Models often wrap a PowerShell script in a launcher, e.g. they call fastsh
+ * with a whole `powershell -NoProfile -Command "<script>"` line. Running that
+ * through cmd.exe loses the inner quoting (`\"` is not an escape there) and
+ * collapses newlines, so the inner script arrives broken. Recognise the
+ * launcher and return the script itself, so it can take the same
+ * `-EncodedCommand` path as native PowerShell syntax.
+ *
+ * Values: null when the command is not a launcher, `{ error }` when the
+ * wrapper cannot be parsed safely, `{ script }` otherwise.
+ */
+export function unwrapPowerShellInvocation(command) {
+  if (typeof command !== 'string') return null
+  const launcher = /^\s*(?:powershell|pwsh)(?:\.exe)?\b([\s\S]*)$/i.exec(command)
+  if (!launcher) return null
+  const rest = launcher[1]
+
+  const encoded = /(?:^|\s)-(?:encodedcommand|enc|e)\b\s+([A-Za-z0-9+/=]+)\s*$/i.exec(rest)
+  if (encoded) {
+    try {
+      return { script: Buffer.from(encoded[1], 'base64').toString('utf16le') }
+    } catch (error) {
+      return { error: `cannot decode -EncodedCommand: ${error?.message ?? error}` }
+    }
+  }
+
+  const inline = /(?:^|\s)-(?:command|com|c)\b([\s\S]*)$/i.exec(rest)
+  if (!inline) return null
+  let body = inline[1].trim()
+  if (body.length === 0) return { error: 'powershell -Command was given no script' }
+
+  const quote = body[0]
+  if (quote === '"' || quote === "'") {
+    if (body.length < 2 || body[body.length - 1] !== quote) {
+      return {
+        error:
+          'powershell -Command has an unterminated quote, so the script cannot be passed ' +
+          'through intact. Put the script in a .ps1 file and run it with `powershell ' +
+          '-NoProfile -ExecutionPolicy Bypass -File <path>`, or use Python for text edits.',
+      }
+    }
+    body = body.slice(1, -1)
+    // cmd's rule for a quoted argument: a doubled quote is one literal quote.
+    body = quote === '"' ? body.replace(/""/g, '"') : body.replace(/''/g, "'")
+  }
+  return body.trim().length === 0
+    ? { error: 'powershell -Command was given an empty script' }
+    : { script: body }
+}
+
 function shellCommand(command, shell) {
+  // A launcher wrapper is peeled off first: the script inside it is what must
+  // run, and leaving it to cmd.exe would corrupt it before PowerShell sees it.
+  const unwrapped = shell === 'cmd' ? null : unwrapPowerShellInvocation(command)
+  if (unwrapped?.error) return { error: unwrapped.error }
+  const script = unwrapped?.script ?? command
+
   const usePowerShell =
-    shell === 'powershell' || (shell !== 'cmd' && detectPowerShell(command))
+    shell === 'powershell' ||
+    (shell !== 'cmd' && (unwrapped !== null || detectPowerShell(script)))
 
   if (usePowerShell) {
     const prologue =
@@ -174,7 +231,7 @@ function shellCommand(command, shell) {
       "$WarningPreference='Continue';" +
       '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;' +
       '$OutputEncoding=[System.Text.Encoding]::UTF8;'
-    const encoded = Buffer.from(prologue + command, 'utf16le').toString('base64')
+    const encoded = Buffer.from(prologue + script, 'utf16le').toString('base64')
     return {
       file: 'powershell.exe',
       args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
@@ -185,7 +242,7 @@ function shellCommand(command, shell) {
   // so the caller's quoting and operators reach cmd unchanged.
   // cmd.exe stops at the first newline, so a multi-line command silently loses
   // every line after the first. Chain them with cmd's own separator instead.
-  return { file: command.replace(/\r?\n/g, ' & '), args: [], options: { shell: true } }
+  return { file: script.replace(/\r?\n/g, ' & '), args: [], options: { shell: true } }
 }
 
 /**
@@ -409,7 +466,23 @@ export function runCommand(request, signal) {
 
   const execute = (native) =>
     new Promise((resolve) => {
-      let { file, args, options } = shellCommand(command, shell)
+      let { file, args, options, error } = shellCommand(command, shell)
+
+    if (error) {
+      resolve({
+        error,
+        exitCode: null,
+        timedOut: false,
+        aborted: false,
+        durationMs: Date.now() - startedAt,
+        stdout: '',
+        stderr: error,
+        stdoutEncoding: 'none',
+        stderrEncoding: 'none',
+        truncated: false,
+      })
+      return
+    }
 
     if (signal?.aborted) {
       resolve({
@@ -672,7 +745,8 @@ export function runCommand(request, signal) {
  */
 export function runInBackground(request) {
   const { command, cwd, shell = 'auto', logFile } = request
-  const { file, args, options } = shellCommand(command, shell)
+  const { file, args, options, error } = shellCommand(command, shell)
+  if (error) throw new Error(error)
   const dir = join(tmpdir(), 'dsh-fastsh')
   mkdirSync(dir, { recursive: true })
   const id = randomUUID().slice(0, 8)
@@ -830,7 +904,8 @@ export function startBackgroundJob(request) {
     ...(toolCall ? { toolCall } : {}),
     ...(outputLimitBytes ? { outputLimitBytes } : {}),
     run(job) {
-      const { file, args, options } = shellCommand(command, shell)
+      const { file, args, options, error } = shellCommand(command, shell)
+      if (error) throw new Error(error)
       const out = createStreamDecoder(encoding)
       const err = createStreamDecoder(encoding)
 
