@@ -6,7 +6,7 @@
  */
 
 import { isAbsolute, resolve } from 'node:path'
-import { clampOutputLimit, runCommand, runInBackground, startBackgroundJob } from './src/exec.js'
+import { clampOutputLimit, formatWatchReport, runCommand, runInBackground, startBackgroundJob } from './src/exec.js'
 
 export const name = 'fastsh'
 
@@ -50,6 +50,12 @@ const PARAMETERS = {
       type: 'string',
       description:
         'Path that receives the command\'s complete raw output (stdout and stderr, byte-faithful, UTF-8). Unlike job_output, which is a bounded ring buffer, this file keeps the whole transcript of a long build. Parent directories are created and an existing file is overwritten.',
+    },
+    watch: {
+      type: 'array',
+      items: { type: 'string' },
+      description:
+        'Files to fingerprint before and after the command (relative to workdir, or absolute). After it runs, each file\'s sha256 and byte size are reported as before/after; unchanged files are marked, and a file that disappears is reported as gone. A relative path resolves against workdir.',
     },
     run_in_background: {
       type: 'boolean',
@@ -99,6 +105,29 @@ const OUTPUT_SCHEMA = {
     logPath: { type: 'string', description: 'The logFile that received the complete raw output.' },
     background: { type: 'boolean', description: 'True for a run_in_background call.' },
     jobId: { type: 'string', description: 'DSH job id for a background run; pass it to job_output or job_kill.' },
+    watching: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Files whose hashes a background job compares when it settles; the report lands in the job output.',
+    },
+    watchReport: {
+      type: 'array',
+      description: 'Per-file before/after sha256 and byte size for the watch parameter.',
+      items: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          before: { type: 'object' },
+          after: { type: 'object' },
+          changed: { type: 'boolean' },
+        },
+      },
+    },
+    warnings: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Human-readable cautions about the command text, e.g. a suspected shell text replacement.',
+    },
     pid: { type: 'integer', description: 'Detached process id when no jobs service was available.' },
     stdoutPath: { type: 'string', description: 'UTF-8 stdout log of a detached fallback run.' },
     stderrPath: { type: 'string', description: 'UTF-8 stderr log of a detached fallback run.' },
@@ -132,16 +161,23 @@ function renderText(value) {
           `stderr: ${v.stderrPath ?? 'unavailable'}`,
         ]
     if (v.concluded) lines.push('this turn ends here; DSH notifies you when the job settles')
+    if (Array.isArray(v.watching) && v.watching.length) lines.push(`watching: ${v.watching.join(', ')}`)
     if (v.logPath) lines.push(`log: ${v.logPath}`)
     return lines.join('\n')
   }
+
+  // 警告与产物对比放在最上面：它们是这次调用最需要先看到的两行。
+  const parts = []
+  for (const warning of Array.isArray(v.warnings) ? v.warnings : []) parts.push(warning)
+  const watchText = formatWatchReport(v.watchReport)
+  if (watchText) parts.push(watchText)
 
   const marks = []
   if (v.timedOut) marks.push('timed out')
   if (v.aborted) marks.push('aborted')
   const head = `[exit code: ${v.exitCode ?? 'unknown'}]${marks.length ? ` [${marks.join(', ')}]` : ''} (${v.durationMs ?? 0} ms)`
 
-  const parts = [head]
+  parts.push(head)
   const stdout = typeof v.stdout === 'string' ? v.stdout.replace(/\s+$/, '') : ''
   if (stdout) parts.push(stdout)
   const stderr = typeof v.stderr === 'string' ? v.stderr.replace(/\s+$/, '') : ''
@@ -181,6 +217,7 @@ function tryStartJob(ctx, request, input, exec) {
       toolCall: callId ? { callId, rootCallId: exec.rootCallId ?? callId } : undefined,
       outputLimitBytes: clampOutputLimit(input.outputLimitBytes),
       logFile: request.logFile,
+      watch: request.watch,
     })
   } catch {
     // The jobs service refuses work when no attached controller serves the owner.
@@ -244,13 +281,19 @@ function createDefinition(ctx) {
         encoding: typeof input.encoding === 'string' ? input.encoding : 'auto',
         logFile:
           typeof input.logFile === 'string' && input.logFile.trim() ? input.logFile.trim() : undefined,
+        watch: Array.isArray(input.watch)
+          ? input.watch
+              .filter((entry) => typeof entry === 'string' && entry.trim() !== '')
+              .map((entry) => entry.trim())
+          : undefined,
       }
 
       if (input.run_in_background === true) {
         const jobId = tryStartJob(ctx, request, input, exec)
+        const watching = request.watch?.length ? { watching: request.watch } : {}
         let value
         if (jobId) {
-          value = stripEmpty({ background: true, jobId })
+          value = stripEmpty({ background: true, jobId, ...watching })
         } else {
           const started = runInBackground(request)
           value = stripEmpty({
@@ -260,6 +303,7 @@ function createDefinition(ctx) {
             stderrPath: started.stderrPath,
             durationMs: 0,
             truncated: false,
+            ...watching,
           })
         }
 

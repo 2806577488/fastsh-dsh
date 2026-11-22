@@ -12,10 +12,19 @@
  */
 
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
-import { closeSync, mkdirSync, openSync, writeFileSync, writeSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import {
+  appendFileSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { Worker } from 'node:worker_threads'
 
 export const DEFAULT_TIMEOUT_MS = 120_000
@@ -110,6 +119,110 @@ export function clampOutputLimit(value) {
   return Math.min(MAX_JOB_OUTPUT_BYTES, Math.max(MIN_JOB_OUTPUT_BYTES, Math.floor(n)))
 }
 
+// ---------------------------------------------------------------------------
+// watch：产物哈希对比
+// ---------------------------------------------------------------------------
+
+/** 一次最多对比多少个文件，防止一条命令把时间全花在采样上。 */
+const MAX_WATCH_FILES = 32
+/** 文本行里只显示哈希前 8 位，完整值留在结果字段里。 */
+const WATCH_HASH_CHARS = 8
+
+/** 清理并去重 watch 参数：只接受非空字符串。 */
+export function normalizeWatchList(value) {
+  if (!Array.isArray(value)) return []
+  const out = []
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue
+    const trimmed = entry.trim()
+    if (trimmed && !out.includes(trimmed)) out.push(trimmed)
+    if (out.length >= MAX_WATCH_FILES) break
+  }
+  return out
+}
+
+/**
+ * 采样一个文件：sha256 + 字节数。
+ * 不存在记 missing，读不到（权限、目录）记 error——采样失败绝不让命令失败。
+ */
+function sampleOne(resolved, display) {
+  try {
+    const stats = statSync(resolved)
+    if (!stats.isFile()) return { path: display, resolved, state: 'error', error: 'not a regular file' }
+    const sha256 = createHash('sha256').update(readFileSync(resolved)).digest('hex')
+    return { path: display, resolved, state: 'file', sha256, size: stats.size }
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { path: display, resolved, state: 'missing' }
+    return { path: display, resolved, state: 'error', error: String(error?.code ?? error?.message ?? error) }
+  }
+}
+
+/**
+ * 命令执行前采样。相对路径按 workdir 解析，和命令本身看到的路径一致。
+ * @returns {{ files: string[], before: object[] } | null}
+ */
+export function snapshotWatch(watch, cwd = process.cwd()) {
+  const files = normalizeWatchList(watch)
+  if (files.length === 0) return null
+  const before = files.map((file) => sampleOne(isAbsolute(file) ? file : resolve(cwd, file), file))
+  return { files, before }
+}
+
+/** 结果对象里用的精简样本：完整哈希保留，展示细节交给 formatWatchReport。 */
+function publicSample(entry, goneWhenMissing) {
+  if (entry.state === 'file') return { sha256: entry.sha256, size: entry.size }
+  if (entry.state === 'missing') return goneWhenMissing ? { gone: true } : { missing: true }
+  return { error: entry.error }
+}
+
+/**
+ * 命令结束后再次采样并对比，返回结构化报告。
+ * 前后完全一致（哈希、字节数、状态都没变）时 changed 为 false。
+ */
+export function finishWatch(snapshot, cwd = process.cwd()) {
+  if (!snapshot) return null
+  const after = snapshot.before.map((entry) =>
+    sampleOne(isAbsolute(entry.path) ? entry.path : resolve(cwd, entry.path), entry.path),
+  )
+  return snapshot.before.map((entry, index) => {
+    const next = after[index]
+    const changed = entry.state !== next.state || entry.sha256 !== next.sha256 || entry.size !== next.size
+    return {
+      path: entry.path,
+      before: publicSample(entry, false),
+      after: publicSample(next, entry.state === 'file'),
+      changed,
+    }
+  })
+}
+
+/**
+ * 人类可读的多行报告，例如：
+ *   watch  out.png
+ *          before 31bf9a2c  (1,234,567 B)
+ *          after  31bf9a2c  (1,234,567 B)   ← 未变化
+ */
+export function formatWatchReport(report) {
+  if (!Array.isArray(report) || report.length === 0) return ''
+  const size = (bytes) => Number(bytes).toLocaleString('en-US')
+  const one = (sample) => {
+    if (!sample) return 'unknown'
+    if (sample.gone) return 'gone'
+    if (sample.missing) return 'missing'
+    if (sample.error) return `error: ${sample.error}`
+    const hash = String(sample.sha256 ?? '')
+    return `${hash.slice(0, WATCH_HASH_CHARS)}  (${size(sample.size ?? 0)} B)`
+  }
+  const lines = []
+  for (const entry of report) {
+    lines.push(`watch  ${entry.path}`)
+    lines.push(`       before ${one(entry.before)}`)
+    const afterLine = `       after  ${one(entry.after)}`
+    lines.push(entry.changed ? afterLine : `${afterLine}   ← 未变化`)
+  }
+  return lines.join('\n')
+}
+
 /**
  * PowerShell's approved verbs, as `Verb-Noun`. A command line containing one
  * is PowerShell, because no cmd built-in or typical external program spells
@@ -121,6 +234,24 @@ const POWERSHELL_VERB =
 /** PowerShell-only syntax that never appears in a valid cmd command line. */
 const POWERSHELL_MARKER =
   /(\$env:|\$_|\$null\b|\$true\b|\$false\b|\$PSVersionTable|\$PSScriptRoot|\$args\b|\$input\b|\[System\.|\[string\]|\[int\]|\[bool\]|\[math\]::|\w+::[A-Za-z]|@\{)/
+
+/**
+ * `& exe` 是 PowerShell 的调用运算符，但模型常把它误写进本来该走 cmd 的命令：
+ * 一旦命令里还有 `&&`，cmd 会直接报「此时不应有 &」。auto 模式只剥离开头那
+ * 一个 `&`；出现在中间的 `&` 是 cmd 的连接符，必须保持原样。
+ */
+export function stripLeadingCallOperator(command, shell) {
+  if (typeof command !== 'string' || shell !== 'auto') return command
+  if (!/^\s*&(?!&)/.test(command)) return command
+  return command.replace(/^\s*&/, '')
+}
+
+/**
+ * 明显的「程序 + 参数」形态：`python -c "…"` / `py -c "…"` / `node -e "…"`。
+ * 脚本内容里的 `$env:` 之类只是程序参数，不代表外层 shell 是 PowerShell。
+ */
+const SCRIPT_LAUNCHER =
+  /^\s*(?:&\s*)?(?:python(?:\d+(?:\.\d+)?)?|py|node|nodejs)(?:\.exe)?\s+(?:-c|-e|--eval|--exec)\b/i
 
 /**
  * Guess whether a command line is PowerShell rather than cmd.
@@ -149,6 +280,9 @@ function blankQuoted(text) {
 
 export function detectPowerShell(command) {
   if (typeof command !== 'string' || command.length === 0) return false
+
+  // 程序 + 参数：脚本里的引号和 `$` 不参与 shell 判定，交给 cmd 原样透传。
+  if (SCRIPT_LAUNCHER.test(command)) return false
 
   // Quoted spans are blanked so markers inside strings never decide the shell.
   const bare = blankQuoted(command)
@@ -215,11 +349,13 @@ export function unwrapPowerShellInvocation(command) {
 }
 
 function shellCommand(command, shell) {
+  // auto 模式先剥离开头的 `&`（PowerShell 调用运算符的误写），再判断走谁。
+  const normalized = stripLeadingCallOperator(command, shell)
   // A launcher wrapper is peeled off first: the script inside it is what must
   // run, and leaving it to cmd.exe would corrupt it before PowerShell sees it.
-  const unwrapped = shell === 'cmd' ? null : unwrapPowerShellInvocation(command)
+  const unwrapped = shell === 'cmd' ? null : unwrapPowerShellInvocation(normalized)
   if (unwrapped?.error) return { error: unwrapped.error }
-  const script = unwrapped?.script ?? command
+  const script = unwrapped?.script ?? normalized
 
   const usePowerShell =
     shell === 'powershell' ||
@@ -308,19 +444,67 @@ function spillFullText(text) {
   }
 }
 
+/** 裁剪时最多捞回多少行错误行，以及单行最多多长。 */
+const MAX_ERROR_LINES = 20
+const MAX_ERROR_LINE_CHARS = 400
+const ERROR_LINE_PATTERN = /error|fail|MISS|denied|refused/i
+
+/**
+ * 从将被裁掉的中间段里挑出错误行。去重后按出现顺序取前 20 行：
+ * 同一句错误刷屏时，重复 20 遍只是噪音。
+ */
+function collectErrorLines(text, from, to) {
+  const hits = []
+  const seen = new Set()
+  for (const rawLine of text.slice(from, to).split(/\r?\n/)) {
+    if (hits.length >= MAX_ERROR_LINES) break
+    if (!ERROR_LINE_PATTERN.test(rawLine)) continue
+    const line = rawLine.trim().slice(0, MAX_ERROR_LINE_CHARS)
+    if (!line || seen.has(line)) continue
+    seen.add(line)
+    hits.push(line)
+  }
+  return hits
+}
+
 function shape(text, maxChars, encoding) {
   if (text.length <= maxChars) return { text, truncated: false, encoding }
   const head = Math.floor(maxChars * 0.35)
   const tail = maxChars - head
   const fullOutputPath = spillFullText(text)
+  // 被裁掉的那段里如果有 ERROR / FAIL / MISS / denied / refused，通常才是
+  // 模型下一步要看的结论。宁可多留几十行，也不能把它们裁没。
+  const errorLines = collectErrorLines(text, head, text.length - tail)
+  const errorBlock = errorLines.length
+    ? `\n\n… 被裁剪的错误行 …\n${errorLines.join('\n')}\n… 错误行结束 …\n`
+    : ''
   return {
     text:
-      `${text.slice(0, head)}\n\n... [${text.length - maxChars} characters omitted] ...\n\n` +
-      text.slice(-tail),
+      `${text.slice(0, head)}\n\n... [${text.length - maxChars} characters omitted] ...` +
+      `${errorBlock}\n\n${text.slice(-tail)}`,
     truncated: true,
     encoding,
     fullOutputPath,
   }
+}
+
+// ---------------------------------------------------------------------------
+// 命令文本里的危险替换
+// ---------------------------------------------------------------------------
+
+/**
+ * 这些痕迹同时出现时，多半是模型想用 shell 拼字符串做文本替换——多行脚本
+ * 或嵌套引号必然在 cmd / PowerShell 里被吞坏。只提示，不改执行行为。
+ */
+const TEXT_REPLACE_PATTERN = /\.Replace\(|-replace\b|sed\s+-i\b|Set-Content\b/i
+
+export function detectTextReplacement(command) {
+  if (typeof command !== 'string' || command === '') return []
+  if (!TEXT_REPLACE_PATTERN.test(command)) return []
+  const multiline = /[\r\n]/.test(command)
+  const quotes = (command.match(/["']/g) ?? []).length
+  if (!multiline && quotes < 3) return []
+  return ['⚠ 疑似 shell 文本替换：建议改用 edit 工具或 Python 脚本（sys.exit(1) 卡 MISS）。']
 }
 
 // ---------------------------------------------------------------------------
@@ -459,10 +643,25 @@ function nativeTimedOutResult(startedAt) {
  * @param {AbortSignal} [signal]
  */
 export function runCommand(request, signal) {
-  const { command, cwd, shell = 'auto', encoding = 'auto', logFile } = request
+  const { command: rawCommand, cwd, shell = 'auto', encoding = 'auto', logFile, watch } = request
+  // 误写的调用运算符在 auto 模式先剥掉，否则 cmd 会报「此时不应有 &」。
+  const command = stripLeadingCallOperator(rawCommand, shell)
   const timeoutMs = clampTimeout(request.timeoutMs)
   const maxChars = clampMaxChars(request.maxChars)
   const startedAt = Date.now()
+
+  // 采样必须在命令启动之前完成，所以放在任何异步分支之前。
+  const watchSnapshot = snapshotWatch(watch, cwd)
+  const warnings = detectTextReplacement(request.command)
+  const finalizeResult = (result) => {
+    let out = result
+    if (watchSnapshot) {
+      const report = finishWatch(watchSnapshot, cwd)
+      if (report) out = { ...out, watchReport: report }
+    }
+    if (warnings.length) out = { ...out, warnings }
+    return out
+  }
 
   const execute = (native) =>
     new Promise((resolve) => {
@@ -724,7 +923,15 @@ export function runCommand(request, signal) {
     })
     })
 
-  if (shell === 'powershell' || !detectPowerShell(command)) return execute(null)
+  // `shell: "cmd"` must stay on cmd: the native PowerShell subset would parse
+  // `& echo hi` as the call operator and spawn a bare `echo`, which fails.
+  if (
+    shell === 'cmd' ||
+    shell === 'powershell' ||
+    !detectPowerShell(command)
+  ) {
+    return execute(null).then(finalizeResult)
+  }
 
   // A native command runs in a worker, so a runaway regex or a huge listing
   // can be terminated instead of freezing the host process.
@@ -737,6 +944,7 @@ export function runCommand(request, signal) {
       return execute(native)
     })
     .catch(() => execute(null))
+    .then(finalizeResult)
 }
 
 /**
@@ -744,9 +952,10 @@ export function runCommand(request, signal) {
  * The caller gets the pid and the paths, so the run survives this turn.
  */
 export function runInBackground(request) {
-  const { command, cwd, shell = 'auto', logFile } = request
+  const { command, cwd, shell = 'auto', logFile, watch } = request
   const { file, args, options, error } = shellCommand(command, shell)
   if (error) throw new Error(error)
+  const watchSnapshot = snapshotWatch(watch, cwd)
   const dir = join(tmpdir(), 'dsh-fastsh')
   mkdirSync(dir, { recursive: true })
   const id = randomUUID().slice(0, 8)
@@ -764,6 +973,19 @@ export function runInBackground(request) {
       stdio: ['ignore', out, err],
       ...options,
     })
+    // 分离进程不等它结束；进程 close 之后把产物对比报告追加进 stdout 日志。
+    if (watchSnapshot) {
+      const snapshot = watchSnapshot
+      child.on('close', () => {
+        const text = formatWatchReport(finishWatch(snapshot, cwd))
+        if (!text) return
+        try {
+          appendFileSync(stdoutPath, `\n${text}\n`, 'utf8')
+        } catch {
+          /* 日志不可写时报告丢失，但不能影响命令本身 */
+        }
+      })
+    }
     child.unref()
     return { pid: child.pid, stdoutPath, stderrPath, command }
   } finally {
@@ -895,7 +1117,7 @@ export function createStreamDecoder(forced = 'auto') {
  * @returns {string} the registry-issued job id
  */
 export function startBackgroundJob(request) {
-  const { jobs, command, cwd, shell = 'auto', encoding = 'auto', label, owner, toolCall, logFile } = request
+  const { jobs, command, cwd, shell = 'auto', encoding = 'auto', label, owner, toolCall, logFile, watch } = request
   const outputLimitBytes = clampOutputLimit(request.outputLimitBytes)
   const spec = {
     kind: 'bash',
@@ -908,6 +1130,16 @@ export function startBackgroundJob(request) {
       if (error) throw new Error(error)
       const out = createStreamDecoder(encoding)
       const err = createStreamDecoder(encoding)
+
+      // 启动前先抓一份产物指纹；命令结束、settle 之前再抓一份并写进 job 输出。
+      let watchSnapshot = snapshotWatch(watch, cwd)
+      const appendWatch = () => {
+        if (!watchSnapshot) return
+        const report = finishWatch(watchSnapshot, cwd)
+        watchSnapshot = null
+        const text = formatWatchReport(report)
+        if (text) job.append(`${text}\n`, { channel: 'stdout' })
+      }
 
       // The job ring is bounded, so the raw transcript also goes to a file.
       let logFd = null
@@ -983,6 +1215,7 @@ export function startBackgroundJob(request) {
 
       child.on('error', (error) => {
         drainDecoders()
+        appendWatch()
         closeLog()
         settle('failed', error?.message ?? String(error))
       })
@@ -994,6 +1227,7 @@ export function startBackgroundJob(request) {
       let exitTimer = null
       const settleFromExit = (code) => {
         drainDecoders()
+        appendWatch()
         closeLog()
         // The registry merges the caller's kill reason into `detail`; do not
         // repeat it here.

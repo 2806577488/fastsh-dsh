@@ -1,4 +1,11 @@
-import { runCommand, runInBackground, decodeOutput, detectPowerShell } from '../src/exec.js'
+import {
+  runCommand,
+  runInBackground,
+  decodeOutput,
+  detectPowerShell,
+  formatWatchReport,
+  startBackgroundJob,
+} from '../src/exec.js'
 import { readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
@@ -182,6 +189,198 @@ function check(name, ok, detail) {
     typeof r.error === 'string' && r.error.includes('unterminated quote'),
     String(r.error).slice(0, 60),
   )
+}
+
+// 14. watch: 产物哈希前后对比
+{
+  const target = 'test/tmp-watch.txt'
+  writeFileSync(target, 'watch-one', 'utf8')
+  const r = await runCommand({ command: 'echo noop', cwd: process.cwd(), watch: [target] })
+  const entry = r.watchReport?.[0]
+  check(
+    'watch unchanged',
+    entry?.changed === false && entry?.before?.sha256 === entry?.after?.sha256 && entry?.before?.size === 9,
+    JSON.stringify(entry),
+  )
+  const text = formatWatchReport(r.watchReport)
+  check(
+    'watch report text',
+    text.includes(`watch  ${target}`) &&
+      text.includes('before ') &&
+      text.includes('after  ') &&
+      text.includes('← 未变化') &&
+      text.includes(entry.before.sha256.slice(0, 8)),
+    JSON.stringify(text),
+  )
+  rmSync(target, { force: true })
+}
+{
+  const target = 'test/tmp-watch.txt'
+  writeFileSync(target, 'before-change', 'utf8')
+  const r = await runCommand({ command: `echo after-change > ${target}`, cwd: process.cwd(), watch: [target] })
+  const entry = r.watchReport?.[0]
+  check(
+    'watch changed',
+    entry?.changed === true && entry?.before?.sha256 !== entry?.after?.sha256,
+    JSON.stringify(entry),
+  )
+  check(
+    'watch changed omits unchanged mark',
+    !formatWatchReport(r.watchReport).includes('未变化'),
+    JSON.stringify(formatWatchReport(r.watchReport)),
+  )
+  rmSync(target, { force: true })
+}
+{
+  const r = await runCommand({ command: 'echo noop', cwd: process.cwd(), watch: ['test/tmp-watch-missing.txt'] })
+  const entry = r.watchReport?.[0]
+  check(
+    'watch missing',
+    entry?.before?.missing === true && entry?.after?.missing === true && entry?.changed === false,
+    JSON.stringify(entry),
+  )
+  check('watch missing text', formatWatchReport(r.watchReport).includes('missing'), JSON.stringify(formatWatchReport(r.watchReport)))
+}
+{
+  const target = 'test/tmp-watch-gone.txt'
+  writeFileSync(target, 'will-be-deleted', 'utf8')
+  const r = await runCommand({ command: `del ${target}`, cwd: process.cwd(), watch: [target] })
+  check(
+    'watch gone',
+    r.watchReport?.[0]?.after?.gone === true && formatWatchReport(r.watchReport).includes('gone'),
+    JSON.stringify(r.watchReport?.[0]),
+  )
+  rmSync(target, { force: true })
+}
+{
+  const target = 'test/tmp-watch-bg.txt'
+  writeFileSync(target, 'before-bg', 'utf8')
+  const appended = []
+  let done = null
+  const jobs = {
+    start(spec) {
+      const handle = {
+        id: 'bash-watch0001',
+        append: (text, options) => appended.push({ text, channel: options?.channel }),
+        updateProgress: () => {},
+      }
+      done = spec.run(handle).done
+      return handle.id
+    },
+  }
+  startBackgroundJob({ jobs, command: `echo after-bg > ${target}`, cwd: process.cwd(), watch: [target] })
+  await done
+  const text = appended.map((a) => a.text).join('')
+  check(
+    'watch report in job output',
+    text.includes(`watch  ${target}`) && text.includes('after') && !text.includes('未变化'),
+    JSON.stringify(text),
+  )
+  rmSync(target, { force: true })
+}
+{
+  const target = 'test/tmp-watch-detached.txt'
+  writeFileSync(target, 'before-detached', 'utf8')
+  const started = runInBackground({ command: `echo after-detached > ${target}`, cwd: process.cwd(), watch: [target] })
+  let text = ''
+  for (let i = 0; i < 100; i++) {
+    text = existsSync(started.stdoutPath) ? readFileSync(started.stdoutPath, 'utf8') : ''
+    if (text.includes('watch  ')) break
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  check(
+    'watch report in detached log',
+    text.includes(`watch  ${target}`) && text.includes('before') && text.includes('after'),
+    JSON.stringify(text.slice(0, 160)),
+  )
+  rmSync(target, { force: true })
+}
+
+// 15. 疑似 shell 文本替换：只在多行或引号嵌套时提示，不改变执行
+{
+  const r = await runCommand({ command: 'echo one\necho -replace a b', cwd: 'C:\\Windows' })
+  check(
+    'replacement warning hit by newline',
+    Array.isArray(r.warnings) && r.warnings.length === 1 && r.warnings[0].includes('疑似 shell 文本替换'),
+    JSON.stringify(r.warnings),
+  )
+}
+{
+  const r = await runCommand({ command: 'echo plain', cwd: 'C:\\Windows' })
+  check('replacement warning miss', r.warnings === undefined, JSON.stringify(r.warnings))
+}
+{
+  const r = await runCommand({ command: 'echo "...Replace(\'a\',\'b\')"', cwd: 'C:\\Windows' })
+  check(
+    'replacement warning hit by nested quotes',
+    Array.isArray(r.warnings) && r.warnings.length === 1,
+    JSON.stringify(r.warnings),
+  )
+}
+
+// 16. shell 猜测边界：开头误写的 `&` 由 auto 模式剥掉，中间的 `&` 原样保留
+{
+  const r = await runCommand({ command: '& echo callop', cwd: 'C:\\Windows' })
+  check(
+    'leading & runs on cmd',
+    r.exitCode === 0 && r.stdout.includes('callop') && !r.error,
+    JSON.stringify({ exit: r.exitCode, out: r.stdout, stderr: r.stderr, error: r.error }),
+  )
+}
+{
+  const r = await runCommand({ command: '& echo one && echo two', cwd: 'C:\\Windows' })
+  check(
+    'leading & with && runs on cmd',
+    r.exitCode === 0 && r.stdout.includes('one') && r.stdout.includes('two'),
+    JSON.stringify({ exit: r.exitCode, out: r.stdout, error: r.error }),
+  )
+}
+{
+  const r = await runCommand({ command: 'echo a & echo b', cwd: 'C:\\Windows' })
+  check('mid & keeps cmd chaining', r.stdout.includes('a') && r.stdout.includes('b'), JSON.stringify(r.stdout))
+}
+
+// 17. shell 猜测边界：`python -c` / `py -c` / `node -e` 是程序 + 参数，不是 PowerShell
+{
+  const launchers = [
+    'python -c "import sys; print(\'$\')"',
+    'py -c "print(1)"',
+    'node -e "console.log(1)"',
+    'python -c "print(\\"$env:PATH\\")"',
+  ]
+  for (const command of launchers) {
+    check(`detect cmd: ${command.slice(0, 24)}`, detectPowerShell(command) === false, String(detectPowerShell(command)))
+  }
+}
+
+// 18. 长输出裁剪：中间被裁掉的错误行要捞回来
+{
+  // cmd 的 type 不接受正斜杠路径，这里用反斜杠。
+  const target = 'test\\tmp-long-output.txt'
+  const lines = []
+  for (let i = 1; i <= 500; i++) {
+    if (i === 250) lines.push('ERROR: boom')
+    else if (i === 251) lines.push('MISS: x')
+    else lines.push(`line ${i} filler`)
+  }
+  writeFileSync(target, `${lines.join('\r\n')}\r\n`, 'utf8')
+  const r = await runCommand({ command: `type ${target}`, cwd: process.cwd(), maxChars: 1000 })
+  check(
+    'trim keeps error lines',
+    r.truncated === true &&
+      r.stdout.includes('ERROR: boom') &&
+      r.stdout.includes('MISS: x') &&
+      r.stdout.includes('被裁剪的错误行'),
+    JSON.stringify({ truncated: r.truncated, head: r.stdout.slice(0, 300), stderr: r.stderr.slice(0, 120) }),
+  )
+  rmSync(target, { force: true })
+}
+
+// 14. `shell: "cmd"` must not be handed to the native PowerShell subset.
+// `Write-Output` is a cmdlet: the native path would succeed, real cmd must fail.
+{
+  const r = await runCommand({ command: 'Write-Output hi', shell: 'cmd', cwd: 'C:\\Windows' })
+  check('forced cmd bypasses native subset', r.exitCode !== 0, `${r.exitCode} ${JSON.stringify(r.stdout)}`)
 }
 
 const failed = results.filter((r) => !r.ok)

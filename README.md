@@ -26,8 +26,9 @@ fastsh 已贴着地板；剩下的差距全部来自 PowerShell 引擎的初始�
 | `description` | 必填，5–10 个词的界面标题 |
 | `workdir` | 工作目录，默认会话工作区 |
 | `timeoutMs` | 默认 120000，限制 1000–600000；超时杀整棵进程树 |
-| `maxOutputChars` | 每路输出默认保留 200000 字符，超出保留头尾并落盘完整文本 |
+| `maxOutputChars` | 每路输出默认保留 200000 字符，超出保留头尾，并把被裁掉的错误行捞回来（最多 20 行） |
 | `logFile` | 完整原始输出落盘路径（UTF-8，stdout+stderr），不受 job 环形缓冲裁剪 |
+| `watch` | 执行前后要对比的文件数组（相对 workdir 或绝对路径）；报告 sha256 与字节数，未变化会标出来 |
 | `run_in_background` | 作为 DSH job 启动，立即返回 job id；用 `job_output` 读、`job_kill` 停 |
 | `outputLimitBytes` | 仅后台任务：job 保留多少字节输出（限制 16 KiB–16 MiB） |
 | `conclude_turn` | 仅后台任务，默认 `true`：启动后立刻结束本轮，不等进程 |
@@ -44,6 +45,27 @@ fastsh 已贴着地板；剩下的差距全部来自 PowerShell 引擎的初始�
 **文件不会被这个工具改写。** `>` / `>>` 由 cmd 自己处理，写的是程序输出的原始
 字节；fastsh 只解码"回显给模型看的那份文本"。需要 UTF-8 落盘时，用 DSH 的
 `write` 工具，或让程序自己输出 UTF-8。
+
+## 产物哈希（watch）
+
+`watch` 解决「命令跑完了，但我不知道产物到底变没变」。它接受一个文件数组，相对
+路径按 `workdir` 解析；执行前采样 `sha256` + 字节数，执行后再采样一次。结果对象里
+是结构化的 `watchReport`（含完整哈希），渲染出来的文本长这样：
+
+```
+watch  out.png
+       before 31bf9a2c  (1,234,567 B)
+       after  31bf9a2c  (1,234,567 B)   ← 未变化
+```
+
+- 有变化时只显示新的哈希，不加「未变化」；
+- 文件被删掉显示 `gone`；本来就不存在显示 `missing`；
+- 读不到（权限、目录）显示 `error: …`，**采样失败绝不会让命令失败**；
+- 文本行只给哈希前 8 位，完整的 64 位值在 `watchReport` 里。
+
+后台任务在 `run(job)` 启动前采样，命令结束、job 结算前把报告 `job.append` 到输出
+里；没有 jobs 服务、回退分离进程时，报告在进程 `close` 后追加进 stdout 日志。
+最多对比 32 个文件。
 
 ## 权限
 
@@ -210,7 +232,31 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 判定刻意保守：这些模式不会出现在合法的 cmd 命令里，所以宁可漏判（退回 cmd 的
 原生错误），也不误判。
 
+两条已经踩过的边界：
+
+- **开头误写的 `&`**：`& exe` 是 PowerShell 的调用运算符，但模型常把它写进本该
+  走 cmd 的命令。`shell: auto` 下会剥掉开头那一个 `&`（只剥首字符；中间的 `&`
+  是 cmd 连接符，保持原样，`&&` 也不动），所以 `& echo a && echo b` 不会再变成
+  一句「此时不应有 &」。
+- **`python -c` / `py -c` / `node -e`**：这是「程序 + 参数」，脚本里的引号和 `$`
+  不参与 shell 判定，一律走 cmd，引号和内容原样透传给程序。精确复现过：脚本里
+  带转义引号时，`blankQuoted` 会提前闭合，`$env:` 漏到未引用区，旧判定会把整条
+  命令抢去 PowerShell。
+
 `shell: "cmd"` / `shell: "powershell"` 可以强制覆盖猜测。
+
+## 文本替换警告
+
+命令文本里出现 `.Replace(`、`-replace`、`sed -i`、`Set-Content`，**且**同时含换行
+或 ≥3 个引号时，结果文本最前面会多一行：
+
+```
+⚠ 疑似 shell 文本替换：建议改用 edit 工具或 Python 脚本（sys.exit(1) 卡 MISS）。
+```
+
+同样的提示也写进结果对象的 `warnings` 字段。这只提示、不改执行行为——多行命令和
+嵌套引号在 cmd / PowerShell 里本来就容易被吞坏，脚本式替换应该走 `write`/`edit`
+或 Python 脚本（失败就 `sys.exit(1)`），别用 shell 拼字符串。
 
 ## 执行隔离
 
@@ -232,13 +278,16 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 
 ## 已验证
 
-在 `test/ps.test.mjs`（40 项）、`test/exec.test.mjs`（28 项）、
-`test/plugin.test.mjs`（24 项）与 `test/jobs.test.mjs`（15 项）中覆盖并通过：
+在 `test/ps.test.mjs`（46 项）、`test/exec.test.mjs`（59 项）、
+`test/plugin.test.mjs`（24 项）、`test/jobs.test.mjs`（17 项）与
+`test/perf.test.mjs`（9 项）中覆盖并通过：
 原生 PowerShell 子集（列目录、管道、Where/ForEach、.NET 静态调用、`$env:`、
 Test-Path）与"不支持必须回退"的边界，中文 GBK 解码、退出码透传、stderr 分离、
 cwd 生效、引号与 `&` 保真、PowerShell 模式、超时杀树、abort、后台日志、
 BOM/GBK 解码、跨块多字节字符、jobs 的完成/失败/取消、`outputLimitBytes`、
-`conclude_turn`、`pwsh` 的 restrict/guard、以及 PowerShell 语法自动识别。
+`conclude_turn`、`pwsh` 的 restrict/guard、PowerShell 语法自动识别、
+`watch` 的前台/后台/分离三种报告、文本替换警告、开头 `&` 剥离与
+`python -c`/`node -e` 判别、长输出裁剪保留错误行。
 
 ## 已知边界
 
