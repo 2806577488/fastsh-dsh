@@ -192,7 +192,7 @@ permission (@deepseek-ai/dsh-permission-presets): pending (waiting for service: 
 
 | 类别 | 支持 |
 |---|---|
-| 文件 | `Get-ChildItem`（`-Name/-File/-Directory/-Recurse/-Filter/-Depth`）、`Get-Item`、`Get-Content`（`-Raw/-TotalCount/-Tail`）、`Set-Content`、`Add-Content`、`New-Item`、`Remove-Item`、`Copy-Item`、`Move-Item`、`Test-Path`、`Join-Path`、`Split-Path`、`Get-Location`、`Resolve-Path`、`Get-FileHash`（`-Algorithm SHA256/SHA1/MD5`，可接管道） |
+| 文件 | `Get-ChildItem`（`-Name/-File/-Directory/-Recurse/-Filter/-Depth`）、`Get-Item`、`Get-Content`（`-Raw/-TotalCount/-Tail/-Encoding`，BOM 自动识别）、`Set-Content`/`Add-Content`（显式 `-Encoding`）、`New-Item`（**不截断已存在文件**）、`Remove-Item`、`Copy-Item`/`Move-Item`（目标为已存在目录时放进目录内）、`Test-Path`、`Join-Path`、`Split-Path`、`Get-Location`、`Resolve-Path`、`Get-FileHash`（`-Algorithm SHA256/SHA1/MD5`，可接管道，1 MiB 分块流式） |
 | 管道 | `Select-Object`（`-First/-Last/-Skip/-Property/-ExpandProperty/-Unique`）、`Where-Object`（属性比较）、`ForEach-Object`（属性取值）、`Sort-Object`、`Measure-Object` |
 | 进程与时间 | `Get-Process`（`-Name/-Id`，走 tasklist，约 0.3 s）、`Get-Date`（`-Format` 支持 .NET 格式串）、`Start-Sleep`（`-Seconds`/`-Milliseconds`，含 `sleep` 别名；原生等待，>30 s 回退真引擎） |
 | 文本与序列化 | `Select-String`（`-Path/-Pattern/-SimpleMatch/-CaseSensitive/-NotMatch`，输出 `路径:行号:内容`）、`Out-File`（`-Encoding/-Append`）、`Tee-Object`（`-FilePath/-Append`，透传）、`ConvertTo-Json`（`-Compress`）、`ConvertFrom-Json`（接字符串或 `Get-Content` 行）、`Format-Table/List/Wide` 与 `Out-String`（透传，由渲染器排版） |
@@ -239,7 +239,7 @@ permission (@deepseek-ai/dsh-permission-presets): pending (waiting for service: 
 - `2>` 重定向写出的文件是 **UTF-16LE**（首字节 `FF FE`）；
 - `Out-File -Encoding utf8` 写出的文件是 **UTF-8 + BOM**（`EF BB BF`）。
 
-fastsh 原生路径一律写 **UTF-8 无 BOM**。这是这个工具存在的理由之一——不把 BOM 塞进下游工具。需要逐字节复刻 PowerShell 行为时，请用 `shell: "powershell"` 显式走真实引擎。
+fastsh 原生路径在**不传 `-Encoding` 时**一律写 **UTF-8 无 BOM**。这是这个工具存在的理由之一——不把 BOM 塞进下游工具。显式传 `-Encoding Unicode`（或 `utf16le`）时按 PowerShell 语义写 **UTF-16LE + BOM**，`-Encoding ascii` 写 Latin-1；写出的文件再读回来走 BOM 自动识别。需要逐字节复刻 PowerShell 的 UTF-8 BOM 行为时，请用 `shell: "powershell"` 显式走真实引擎。
 
 实测（同一台机器）：
 
@@ -354,7 +354,7 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 
 ## 已验证
 
-在 `test/ps.test.mjs`（96 项）、`test/exec.test.mjs`（76 项）、
+在 `test/ps.test.mjs`（105 项）、`test/exec.test.mjs`（76 项）、
 `test/plugin.test.mjs`（25 项）、`test/jobs.test.mjs`（19 项）与
 `test/perf.test.mjs`（9 项）中覆盖并通过：
 原生 PowerShell 子集（列目录、管道、Where/ForEach、.NET 静态调用、`$env:`、
@@ -363,6 +363,8 @@ Test-Path）与"不支持必须回退"的边界，路径参数里的变量展开
 `Get-FileHash`/`ConvertFrom-Json`/`Resolve-Path`/`Select-Object -Unique`/`Format-Table`
 透传与 `-ErrorAction`（含"护栏拒绝不可抑制"），PATH 覆盖提醒（整体赋值/`setx`/
 `$env:PATH`，追加不提示），原生 `Start-Sleep`（毫秒/小数秒/别名/超长回退），
+`New-Item` 不截断、`Get-Content -Encoding`/BOM、UTF-16 写入、Copy/Move 目标目录语义、
+`Get-FileHash` 分块流式，
 中文 GBK 解码、退出码透传、stderr 分离、
 cwd 生效、引号与 `&` 保真、PowerShell 模式、超时杀树、abort、后台日志、
 BOM/GBK 解码、混合编码按行解码（UTF-8 `√` + GBK 中文同一路输出）、跨块多字节字符、
@@ -388,3 +390,6 @@ jobs 的完成/失败/取消、`outputLimitBytes`、
 - 没有 jobs 服务时后台任务回退为分离进程，此时用 `pid` + `taskkill` 管理。
 - 超时后如果进程树仍持有管道句柄，结果最多延迟 5 秒返回（兜底定时器）。
 - 输出超过 16 MiB 时只保留尾部，并标记 `truncated`。
+- `Get-ChildItem` 不区分隐藏/系统项（PowerShell 默认隐藏它们）。
+- `Remove-Item a.txt,b.txt` 这种逗号多路径不支持（会按一个字面路径报错）；逐个删或走管道。
+- `Move-Item` 跨卷时 `rename` 会失败（EXDEV），需要用 `Copy-Item` + `Remove-Item`。

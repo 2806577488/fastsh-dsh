@@ -557,6 +557,109 @@ function sleepBlocking(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }
 
+const utf8Decoder = new TextDecoder('utf-8')
+const utf16Decoder = new TextDecoder('utf-16le')
+const utf16beDecoder = new TextDecoder('utf-16be')
+
+/** BOM of a file, read from a three-byte prefix: 'utf16le' | 'utf16be' | 'utf8' | null. */
+function readBom(path) {
+  const fd = openSync(path, 'r')
+  try {
+    const head = Buffer.alloc(3)
+    const read = readSync(fd, head, 0, 3, 0)
+    if (read >= 2 && head[0] === 0xff && head[1] === 0xfe) return 'utf16le'
+    if (read >= 2 && head[0] === 0xfe && head[1] === 0xff) return 'utf16be'
+    if (read >= 3 && head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf) return 'utf8'
+    return null
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/** Decode a file buffer: explicit -Encoding wins, then a BOM, then UTF-8/GBK. */
+function decodeFileBuffer(buffer, encoding) {
+  const requested = String(encoding ?? '').trim().toLowerCase()
+  const utf16leBom = buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe
+  const utf16beBom = buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff
+  const utf8Bom = buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf
+
+  if (!requested) {
+    if (utf16leBom) return utf16Decoder.decode(buffer.subarray(2))
+    if (utf16beBom) return utf16beDecoder.decode(buffer.subarray(2))
+    if (utf8Bom) return utf8Decoder.decode(buffer.subarray(3))
+    return decodeBytes(buffer)
+  }
+  if (requested === 'unicode' || requested === 'utf16le' || requested === 'utf16') {
+    return utf16Decoder.decode(buffer.subarray(utf16leBom ? 2 : 0))
+  }
+  if (requested === 'bigendianunicode' || requested === 'utf16be') {
+    return utf16beDecoder.decode(buffer.subarray(utf16beBom ? 2 : 0))
+  }
+  if (requested === 'utf8' || requested === 'utf8nobom') {
+    return utf8Decoder.decode(buffer.subarray(utf8Bom ? 3 : 0))
+  }
+  if (requested === 'ascii' || requested === 'default' || requested === 'oem') {
+    return buffer.toString('latin1')
+  }
+  nope(`encoding ${requested}`)
+}
+
+/** PowerShell's line split: \r\n and \n, without a trailing empty line. */
+function splitLines(text) {
+  const lines = text.split(/\r?\n/)
+  if (lines.length && lines[lines.length - 1] === '') lines.pop()
+  return lines
+}
+
+function tailLinesOf(text, count) {
+  if (count <= 0) return []
+  return splitLines(text).slice(-count)
+}
+
+const BOM_UTF16LE = Buffer.from([0xff, 0xfe])
+
+/** Byte codec for -Encoding on write cmdlets; PowerShell's Unicode is UTF-16LE. */
+function writeCodec(encoding, context) {
+  const text = String(valueOf(encoding ?? '', context)).trim().toLowerCase()
+  if (!text || text === 'utf8' || text === 'utf8nobom' || text === 'default') return { codec: 'utf8', bom: false }
+  if (text === 'unicode' || text === 'utf16le' || text === 'utf16') return { codec: 'utf16le', bom: true }
+  if (text === 'ascii') return { codec: 'latin1', bom: false }
+  nope(`encoding ${text}`)
+}
+
+function encodeText(text, codec, bom) {
+  if (codec === 'utf16le') {
+    const body = Buffer.from(text, 'utf16le')
+    return bom ? Buffer.concat([BOM_UTF16LE, body]) : body
+  }
+  if (codec === 'latin1') return Buffer.from(text, 'latin1')
+  return Buffer.from(text, 'utf8')
+}
+
+/** Hash a file in 1 MiB chunks instead of loading it whole. */
+function hashFile(path, codec) {
+  const hash = createHash(codec)
+  const fd = openSync(path, 'r')
+  const buffer = Buffer.allocUnsafe(1024 * 1024)
+  try {
+    let read
+    while ((read = readSync(fd, buffer, 0, buffer.length, null)) > 0) hash.update(buffer.subarray(0, read))
+  } finally {
+    closeSync(fd)
+  }
+  return hash.digest('hex').toUpperCase()
+}
+
+/** PowerShell puts the item inside an existing destination directory. */
+function destinationFor(source, destination) {
+  try {
+    if (existsSync(destination) && statSync(destination).isDirectory()) return join(destination, basename(source))
+  } catch {
+    /* fall through to the literal destination */
+  }
+  return destination
+}
+
 function runCmdlet(stage, input, context) {
   const { name, params, positional } = stage
   const args = [...positional]
@@ -602,40 +705,48 @@ function runCmdlet(stage, input, context) {
     case 'cat':
     case 'type': {
       const path = toPath(param(params, 'path') ?? args[0], context)
-      if (truthy(params.get('raw'))) return readFileSync(path, 'utf8')
+      const encodingParam = param(params, 'encoding')
+      const explicit = encodingParam !== undefined ? String(valueOf(encodingParam, context)).trim() : ''
+      const raw = truthy(params.get('raw'))
 
-      const tail = param(params, 'tail')
-      if (tail !== undefined) return readTailLines(path, Number(valueOf(tail, context)) || 0)
-
-      const first = param(params, 'totalcount') ?? param(params, 'head')
-      if (first !== undefined) {
-        const count = Number(valueOf(first, context)) || 0
-        const lines = []
-        // Only read until the requested count is satisfied.
-        forEachLine(path, (line) => {
-          lines.push(line)
-          return lines.length >= count ? false : undefined
-        })
-        return lines
+      if (raw) {
+        return explicit || readBom(path)
+          ? decodeFileBuffer(readFileSync(path), explicit || undefined)
+          : readFileSync(path, 'utf8')
       }
 
-      const lines = []
-      forEachLine(path, (line) => {
-        lines.push(line)
-      })
+      const tail = param(params, 'tail')
+      if (tail !== undefined) {
+        const count = Number(valueOf(tail, context)) || 0
+        // The windowed tail path assumes UTF-8; a BOM or explicit encoding
+        // needs the whole file decoded first.
+        if (explicit || readBom(path)) {
+          return tailLinesOf(decodeFileBuffer(readFileSync(path), explicit || undefined), count)
+        }
+        return readTailLines(path, count)
+      }
+
+      const text =
+        explicit || readBom(path) ? decodeFileBuffer(readFileSync(path), explicit || undefined) : readFileSync(path, 'utf8')
+      const lines = splitLines(text)
+      const first = param(params, 'totalcount') ?? param(params, 'head')
+      if (first !== undefined) return lines.slice(0, Number(valueOf(first, context)) || 0)
       return lines
     }
     case 'set-content':
     case 'sc': {
       const path = toPath(param(params, 'path') ?? args[0], context)
       const value = param(params, 'value') ?? args[1] ?? ''
-      writeFileSync(path, `${valueOf(value, context)}\n`, 'utf8')
+      const { codec, bom } = writeCodec(param(params, 'encoding'), context)
+      const body = encodeText(`${valueOf(value, context)}\n`, codec, bom)
+      writeFileSync(path, body)
       return ''
     }
     case 'add-content': {
       const path = toPath(param(params, 'path') ?? args[0], context)
       const value = param(params, 'value') ?? args[1] ?? ''
-      appendFileSync(path, `${valueOf(value, context)}\n`, 'utf8')
+      const { codec } = writeCodec(param(params, 'encoding'), context)
+      appendFileSync(path, encodeText(`${valueOf(value, context)}\n`, codec, false))
       return ''
     }
     case 'new-item':
@@ -649,8 +760,17 @@ function runCmdlet(stage, input, context) {
         symlinkSync(toPath(String(valueOf(target, context)), context), path, type === 'junction' ? 'junction' : 'dir')
         return shapeItem(path)
       }
-      if (type === 'directory' || type === 'dir') mkdirSync(path, { recursive: truthy(params.get('force')) })
-      else writeFileSync(path, '', 'utf8')
+      if (type === 'directory' || type === 'dir') {
+        mkdirSync(path, { recursive: truthy(params.get('force')) })
+        return shapeItem(path)
+      }
+      // PowerShell never truncates an existing file: without -Force it errors,
+      // with -Force it returns the existing item unchanged.
+      if (existsSync(path)) {
+        if (!truthy(params.get('force'))) throw new Error(`fastsh: 文件已存在 ${path}`)
+        return shapeItem(path)
+      }
+      writeFileSync(path, '', 'utf8')
       return shapeItem(path)
     }
     case 'remove-item':
@@ -682,17 +802,21 @@ function runCmdlet(stage, input, context) {
     case 'copy-item':
     case 'cp':
     case 'copy': {
-      const path = toPath(param(params, 'path') ?? args[0], context)
-      const destination = toPath(param(params, 'destination') ?? args[1], context)
-      cpSync(path, destination, { recursive: truthy(params.get('recurse')), force: truthy(params.get('force')) })
+      const source = toPath(param(params, 'path') ?? args[0], context)
+      const destination = destinationFor(source, toPath(param(params, 'destination') ?? args[1], context))
+      cpSync(source, destination, { recursive: truthy(params.get('recurse')), force: truthy(params.get('force')) })
       return ''
     }
     case 'move-item':
     case 'mv':
     case 'move': {
-      const path = toPath(param(params, 'path') ?? args[0], context)
-      const destination = toPath(param(params, 'destination') ?? args[1], context)
-      renameSync(path, destination)
+      const source = toPath(param(params, 'path') ?? args[0], context)
+      const destination = destinationFor(source, toPath(param(params, 'destination') ?? args[1], context))
+      // PowerShell refuses to overwrite without -Force.
+      if (!truthy(params.get('force')) && existsSync(destination)) {
+        throw new Error(`fastsh: 目标已存在 ${destination}（加 -Force 覆盖）`)
+      }
+      renameSync(source, destination)
       return ''
     }
     case 'join-path': {
@@ -775,12 +899,12 @@ function runCmdlet(stage, input, context) {
       const value = input !== undefined ? input : (param(params, 'inputobject') ?? args[1] ?? '')
       const lines = Array.isArray(value) ? value : [value]
       const text = `${lines.map((line) => renderValue(line)).join('\n')}\n`
-      const encoding = String(valueOf(param(params, 'encoding') ?? 'utf8', context)).toLowerCase()
-      // PowerShell 5.1 writes a BOM; this tool deliberately writes BOM-free
-      // UTF-8 so downstream tools never see U+FEFF.
-      const codec = encoding === 'unicode' || encoding === 'utf16le' ? 'utf16le' : 'utf8'
-      if (truthy(params.get('append'))) appendFileSync(filePath, text, codec)
-      else writeFileSync(filePath, text, codec)
+      // Explicit -Encoding is honored; the default stays BOM-free UTF-8 (the
+      // one deliberate difference from PowerShell 5.1's BOM).
+      const { codec, bom } = writeCodec(param(params, 'encoding'), context)
+      const body = encodeText(text, codec, bom)
+      if (truthy(params.get('append'))) appendFileSync(filePath, encodeText(text, codec, false))
+      else writeFileSync(filePath, body)
       return ''
     }
     case 'convertto-json': {
@@ -820,7 +944,7 @@ function runCmdlet(stage, input, context) {
       const hashes = targets.map((target) => {
         const resolved = toPath(target, context)
         if (!statSync(resolved).isFile()) throw new Error(`fastsh: 不是文件 ${resolved}`)
-        const hash = createHash(codec).update(readFileSync(resolved)).digest('hex').toUpperCase()
+        const hash = hashFile(resolved, codec)
         return { Algorithm: algorithm, Hash: hash, Path: resolved }
       })
       return hashes.length === 1 ? hashes[0] : hashes

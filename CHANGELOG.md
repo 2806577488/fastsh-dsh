@@ -1,5 +1,18 @@
 # 更新记录
 
+## v1.9.4
+
+- `New-Item -ItemType File` 不再截断已存在文件：无 `-Force` 报错，有 `-Force` 返回原文件
+  （此前无条件 `writeFileSync('')`，会把已有内容清空）。
+- `Get-Content` 支持 `-Encoding`（unicode/utf16le/utf8/ascii）并自动识别 BOM；`-Raw`、
+  `-Tail`、`-TotalCount` 都走同一解码。此前 UTF-16 文件按 UTF-8 读，全是乱码。
+- `Set-Content` / `Add-Content` / `Out-File` 的显式 `-Encoding` 生效：`Unicode` 写
+  UTF-16LE + BOM，`ascii` 写 Latin-1；不传时仍是 UTF-8 无 BOM。
+- `Copy-Item` / `Move-Item` 目标为已存在目录时把项放进目录内（`dest\源名`），
+  不再把目录内容合并进目标；`Move-Item` 无 `-Force` 覆盖已存在目标时报错。
+- `Get-FileHash` 改为 1 MiB 分块读取，大文件不再整份读进内存。
+- 文档补充已知边界（逗号多路径、隐藏项、跨卷 Move）；测试 ps 96 → 105。
+
 ## v1.9.3
 
 - 修混合编码日志的 `��` / 乱码：前台输出与 job 流式解码都改成**按行**判定编码。

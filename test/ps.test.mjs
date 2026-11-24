@@ -579,6 +579,68 @@ const check = (name, cond, detail) => (cond ? ok : bad).push(`${name} ${detail ?
   )
 }
 
+// fidelity: New-Item never truncates, Get-Content honors -Encoding/BOM,
+// Copy/Move place items inside an existing directory, Get-FileHash streams
+{
+  const root = 'test/tmp-fidelity'
+  rmSync(root, { recursive: true, force: true })
+  mkdirSync(root, { recursive: true })
+  const ctx = { cwd: resolve(root), env: process.env }
+  const runIn = (command) => runNativePowerShell(command, ctx)
+
+  writeFileSync(`${root}/keep.txt`, 'IMPORTANT', 'utf8')
+  const newForce = runIn('New-Item -ItemType File -Path keep.txt -Force')
+  check(
+    'new-item -Force keeps existing content',
+    newForce && newForce.exitCode === 0 && readFileSync(`${root}/keep.txt`, 'utf8') === 'IMPORTANT',
+    JSON.stringify(newForce),
+  )
+  const newPlain = runIn('New-Item -ItemType File -Path keep.txt')
+  check(
+    'new-item existing without -Force fails',
+    newPlain && newPlain.exitCode === 1 && readFileSync(`${root}/keep.txt`, 'utf8') === 'IMPORTANT',
+    JSON.stringify(newPlain),
+  )
+  const newFile = runIn('New-Item -ItemType File -Path fresh.txt')
+  check('new-item creates a missing file', newFile && newFile.exitCode === 0 && existsSync(`${root}/fresh.txt`), JSON.stringify(newFile))
+
+  writeFileSync(`${root}/u16.txt`, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('中文内容', 'utf16le')]))
+  check('get-content -Encoding Unicode', runIn('Get-Content u16.txt -Encoding Unicode')?.stdout === '中文内容', JSON.stringify(runIn('Get-Content u16.txt -Encoding Unicode')?.stdout))
+  check('get-content detects a UTF-16 BOM', runIn('Get-Content u16.txt')?.stdout === '中文内容', JSON.stringify(runIn('Get-Content u16.txt')?.stdout))
+
+  const setR = runIn('Set-Content -Path out16.txt -Value hello -Encoding Unicode')
+  const bytes = existsSync(`${root}/out16.txt`) ? readFileSync(`${root}/out16.txt`) : Buffer.alloc(0)
+  check(
+    'set-content -Encoding Unicode writes UTF-16LE with BOM',
+    setR && setR.exitCode === 0 && bytes[0] === 0xff && bytes[1] === 0xfe && bytes.subarray(2).toString('utf16le').trim() === 'hello',
+    JSON.stringify([...bytes.slice(0, 6)]),
+  )
+
+  mkdirSync(`${root}/src/deep`, { recursive: true })
+  writeFileSync(`${root}/src/deep/f.txt`, 'x', 'utf8')
+  mkdirSync(`${root}/dest`, { recursive: true })
+  const copyR = runIn('Copy-Item src dest -Recurse')
+  check(
+    'copy-item dir into existing dir',
+    copyR && copyR.exitCode === 0 && existsSync(`${root}/dest/src/deep/f.txt`) && !existsSync(`${root}/dest/deep`),
+    JSON.stringify(copyR),
+  )
+
+  mkdirSync(`${root}/m1`, { recursive: true })
+  writeFileSync(`${root}/m1/f.txt`, 'x', 'utf8')
+  mkdirSync(`${root}/m2`, { recursive: true })
+  const moveR = runIn('Move-Item m1 m2')
+  check('move-item dir into existing dir', moveR && moveR.exitCode === 0 && existsSync(`${root}/m2/m1/f.txt`), JSON.stringify(moveR))
+
+  const big = `${root}/big.bin`
+  writeFileSync(big, Buffer.alloc(3 * 1024 * 1024 + 17, 7))
+  const hashR = runIn('Get-FileHash big.bin')
+  const expected = createHash('sha256').update(readFileSync(big)).digest('hex').toUpperCase()
+  check('get-filehash chunked', hashR && JSON.parse(hashR.stdout).Hash === expected, JSON.stringify(hashR?.stdout?.slice(0, 40)))
+
+  rmSync(root, { recursive: true, force: true })
+}
+
 console.log('PASS:\n  ' + ok.join('\n  '))
 if (bad.length) {
   console.log('FAIL:\n  ' + bad.join('\n  '))
