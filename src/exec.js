@@ -57,8 +57,12 @@ if (!ansiDecoder) ansiDecoder = latin1
 
 /**
  * Decode one captured stream without guessing wrong on valid UTF-8.
- * BOMs win outright; otherwise strict UTF-8 is tried first and the system
- * ANSI code page is the fallback (cp936 output from legacy tools).
+ *
+ * One build can mix encodings in a single stream: the JVM writes UTF-8
+ * (`√ Build …`) while a native child tool writes the ANSI code page (GBK
+ * here). Decoding the whole buffer with one choice turns the other half into
+ * `��` or mojibake, so lines are decoded one by one and each line picks its
+ * own encoding. BOMs still win outright.
  */
 export function decodeOutput(buffer, forced = 'auto') {
   if (!buffer || buffer.length === 0) return { text: '', encoding: 'none' }
@@ -87,11 +91,42 @@ export function decodeOutput(buffer, forced = 'auto') {
       ? buffer.subarray(3)
       : buffer
 
-  try {
-    return { text: utf8Strict.decode(body), encoding: 'utf-8' }
-  } catch {
-    return { text: ansiDecoder.decode(body), encoding: ansiLabel }
+  const { text, encodings } = decodeLines(body)
+  const encoding = encodings.size === 0 ? 'utf-8' : encodings.size === 1 ? [...encodings][0] : 'mixed'
+  return { text, encoding }
+}
+
+/**
+ * Decode a buffer line by line, letting each line choose UTF-8 or the ANSI
+ * code page. `\r` and `\n` are plain ASCII, so splitting on them never cuts a
+ * multi-byte character in half.
+ */
+function decodeLines(buffer) {
+  const parts = []
+  const encodings = new Set()
+  let start = 0
+  const flush = (end) => {
+    const segment = buffer.subarray(start, end)
+    start = end
+    if (segment.length === 0) return
+    if (isAscii(segment)) {
+      parts.push(segment.toString('latin1'))
+      return
+    }
+    try {
+      parts.push(utf8Strict.decode(segment))
+      encodings.add('utf-8')
+    } catch {
+      parts.push(ansiDecoder.decode(segment))
+      encodings.add(ansiLabel)
+    }
   }
+  for (let i = 0; i < buffer.length; i++) {
+    const byte = buffer[i]
+    if (byte === 0x0a || byte === 0x0d) flush(i + 1)
+  }
+  flush(buffer.length)
+  return { text: parts.join(''), encodings }
 }
 
 export function clampTimeout(value) {
@@ -1075,41 +1110,12 @@ export function runInBackground(request) {
 // Streaming decode for live job output
 // ---------------------------------------------------------------------------
 
-/** How many non-ASCII bytes to hold before committing to UTF-8. */
-const DECIDE_AFTER_BYTES = 8 * 1024
+/** A line without a break must not buffer without bound. */
 const MAX_PENDING_BYTES = 256 * 1024
 
 function isAscii(buf) {
   for (let i = 0; i < buf.length; i++) if (buf[i] > 0x7f) return false
   return true
-}
-
-/**
- * Walk a byte prefix as UTF-8.
- * `invalid` means it can never be UTF-8; `incomplete` is how many trailing
- * bytes still form an unfinished sequence (wait for the next chunk).
- */
-function validateUtf8(buf) {
-  let i = 0
-  while (i < buf.length) {
-    const byte = buf[i]
-    if (byte < 0x80) {
-      i += 1
-      continue
-    }
-    let need
-    if (byte >= 0xc2 && byte <= 0xdf) need = 1
-    else if (byte >= 0xe0 && byte <= 0xef) need = 2
-    else if (byte >= 0xf0 && byte <= 0xf4) need = 3
-    else return { invalid: true, incomplete: 0 }
-    if (i + need >= buf.length) return { invalid: false, incomplete: buf.length - i }
-    for (let k = 1; k <= need; k++) {
-      const continuation = buf[i + k]
-      if (continuation < 0x80 || continuation > 0xbf) return { invalid: true, incomplete: 0 }
-    }
-    i += need + 1
-  }
-  return { invalid: false, incomplete: 0 }
 }
 
 function labelFor(value) {
@@ -1121,56 +1127,86 @@ function labelFor(value) {
 
 /**
  * Incremental decoder that never splits a multi-byte character across chunks.
- * In "auto" mode it stays undecided while the stream is ASCII, then commits to
- * UTF-8 when the held bytes are valid UTF-8 up to a line break (or ~8 KiB),
- * and to the system ANSI code page as soon as the bytes cannot be UTF-8.
+ *
+ * Auto mode decides per line instead of once per stream: a build can print a
+ * UTF-8 glyph from the JVM and GBK Chinese from a native child, and committing
+ * one encoding for the whole stream corrupts the other part (`��` / mojibake).
+ * Bytes are held until a `\r`/`\n` boundary, then each line is decoded with
+ * whichever encoding it is valid in. A single line mixing both encodings is
+ * still ambiguous and will show one of them wrong.
  */
 export function createStreamDecoder(forced = 'auto') {
-  let decoder = null
-  let decided = null
-  let pending = []
-  let pendingBytes = 0
+  if (forced !== 'auto') {
+    const label = labelFor(forced)
+    const decoder = new TextDecoder(label)
+    return {
+      get encoding() {
+        return label
+      },
+      push(chunk) {
+        return chunk && chunk.length ? decoder.decode(chunk, { stream: true }) : ''
+      },
+      flush() {
+        return decoder.decode()
+      },
+    }
+  }
 
-  const start = (label, carry) => {
-    decided = label
-    decoder = new TextDecoder(label)
-    pending = []
-    pendingBytes = 0
-    return decoder.decode(carry, { stream: true })
+  let pending = Buffer.alloc(0)
+  const encodings = new Set()
+
+  const decodeSegment = (segment) => {
+    if (segment.length === 0) return ''
+    if (isAscii(segment)) return segment.toString('latin1')
+    try {
+      const text = utf8Strict.decode(segment)
+      encodings.add('utf-8')
+      return text
+    } catch {
+      encodings.add(ansiLabel)
+      return ansiDecoder.decode(segment)
+    }
+  }
+
+  const drain = (final) => {
+    let out = ''
+    let start = 0
+    for (let i = 0; i < pending.length; i++) {
+      const byte = pending[i]
+      if (byte === 0x0a || byte === 0x0d) {
+        out += decodeSegment(pending.subarray(start, i + 1))
+        start = i + 1
+      }
+    }
+    pending = pending.subarray(start)
+    // A very long line without a break must not buffer without bound; cut on a
+    // UTF-8 character boundary so a trailing multi-byte sequence is not split.
+    if (pending.length > MAX_PENDING_BYTES) {
+      let cut = pending.length
+      while (cut > 0 && (pending[cut - 1] & 0xc0) === 0x80) cut -= 1
+      if (cut === 0) cut = pending.length
+      out += decodeSegment(pending.subarray(0, cut))
+      pending = pending.subarray(cut)
+    }
+    if (final) {
+      out += decodeSegment(pending)
+      pending = Buffer.alloc(0)
+    }
+    return out
   }
 
   return {
     get encoding() {
-      return decided
+      if (encodings.size === 0) return null
+      return encodings.size === 1 ? [...encodings][0] : 'mixed'
     },
     push(chunk) {
       if (!chunk || chunk.length === 0) return ''
-      if (decoder) return decoder.decode(chunk, { stream: true })
-
-      if (forced !== 'auto') return start(labelFor(forced), chunk)
-
-      // Pure ASCII is identical in every encoding, so emit it right away.
-      if (pendingBytes === 0 && isAscii(chunk)) return chunk.toString('latin1')
-
-      pending.push(chunk)
-      pendingBytes += chunk.length
-      const all = Buffer.concat(pending)
-
-      const verdict = validateUtf8(all)
-      if (verdict.invalid) return start(ansiLabel, all)
-      if (verdict.incomplete === 0 && (all.includes(0x0a) || pendingBytes >= DECIDE_AFTER_BYTES)) {
-        return start('utf-8', all)
-      }
-      if (pendingBytes > MAX_PENDING_BYTES) return start('utf-8', all)
-      return ''
+      pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk])
+      return drain(false)
     },
     flush() {
-      if (decoder) return decoder.decode()
-      if (pending.length === 0) return ''
-      const all = Buffer.concat(pending)
-      pending = []
-      pendingBytes = 0
-      return all.toString('utf8')
+      return drain(true)
     },
   }
 }

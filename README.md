@@ -38,9 +38,14 @@ fastsh 已贴着地板；剩下的差距全部来自 PowerShell 引擎的初始�
 ## 编码策略
 
 1. 有 BOM 时按 BOM 解码（UTF-16LE / UTF-16BE / UTF-8 BOM 会被剥离）。
-2. 用 `TextDecoder('utf-8', { fatal: true })` 严格解码；所有字节合法即按 UTF-8。
-3. 不合法则回退系统 ANSI 代码页（本机 `gbk`），覆盖老式 Win32 工具的 GBK 输出。
-4. 两路输出各自判断，互不影响。
+2. **按行**判断：每行用 `TextDecoder('utf-8', { fatal: true })` 严格解码，合法即 UTF-8，
+   不合法则该行回退系统 ANSI 代码页（本机 `gbk`）。
+3. 为什么按行：一次构建可能在同一路输出里混写编码——JVM（Gradle/Flutter）写 UTF-8 的
+   `√`，原生子工具写 GBK 的中文。整段只判一次的话，另一半会变成 `��`（UTF-8 判成 GBK
+   则表现为 `鈭?` 这类乱码）。`\r` / `\n` 是 ASCII，按行切不会切断多字节字符。
+4. 单行内部混写两种编码仍然无法区分（会显示其中一种的错误结果），但正常构建脚本不会
+   一行里换编码。
+5. 两路输出各自判断，互不影响；整体标签为 `utf-8` / `gbk` / `mixed`。
 
 **文件不会被这个工具改写。** `>` / `>>` 由 cmd 自己处理，写的是程序输出的原始
 字节；fastsh 只解码"回显给模型看的那份文本"。需要 UTF-8 落盘时，用 DSH 的
@@ -96,10 +101,10 @@ watch  out.png
   后以 `completed / failed / killed` 结束。
 
 输出用 `job.append(text, { channel })` 推入环形缓冲。为了支持**实时**输出，
-`src/exec.js` 里有一个增量解码器 `createStreamDecoder`：纯 ASCII 直接放行，
-遇到非 ASCII 时先挂起，等到一行结束（或 8 KiB）再判定——合法 UTF-8 就按 UTF-8，
-否则按 GBK；判定后改用 `TextDecoder` 的 streaming 模式，所以跨块的多字节字符
-不会被切坏。
+`src/exec.js` 里有一个增量解码器 `createStreamDecoder`：按行缓冲，遇到 `\r`/`\n`
+边界就解码该行——合法 UTF-8 按 UTF-8，否则按 GBK；没有行边界时最多缓冲 256 KiB
+（并在 UTF-8 字符边界上切），所以跨块的多字节字符不会被切坏，混合编码的构建日志
+也能逐行正确显示。
 
 如果 profile 里没有 `jobs` 服务，或者没有为这个 owner 挂上 controller，
 `jobs.start` 会拒绝；此时自动回退到分离进程 + UTF-8 日志文件，返回 `pid` 和
@@ -349,8 +354,8 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 
 ## 已验证
 
-在 `test/ps.test.mjs`（96 项）、`test/exec.test.mjs`（75 项）、
-`test/plugin.test.mjs`（25 项）、`test/jobs.test.mjs`（17 项）与
+在 `test/ps.test.mjs`（96 项）、`test/exec.test.mjs`（76 项）、
+`test/plugin.test.mjs`（25 项）、`test/jobs.test.mjs`（19 项）与
 `test/perf.test.mjs`（9 项）中覆盖并通过：
 原生 PowerShell 子集（列目录、管道、Where/ForEach、.NET 静态调用、`$env:`、
 Test-Path）与"不支持必须回退"的边界，路径参数里的变量展开（`$HOME`、`$env:X`、
@@ -360,7 +365,8 @@ Test-Path）与"不支持必须回退"的边界，路径参数里的变量展开
 `$env:PATH`，追加不提示），原生 `Start-Sleep`（毫秒/小数秒/别名/超长回退），
 中文 GBK 解码、退出码透传、stderr 分离、
 cwd 生效、引号与 `&` 保真、PowerShell 模式、超时杀树、abort、后台日志、
-BOM/GBK 解码、跨块多字节字符、jobs 的完成/失败/取消、`outputLimitBytes`、
+BOM/GBK 解码、混合编码按行解码（UTF-8 `√` + GBK 中文同一路输出）、跨块多字节字符、
+jobs 的完成/失败/取消、`outputLimitBytes`、
 `conclude_turn`、`pwsh` 的 restrict/guard、PowerShell 语法自动识别、
 `watch` 的前台/后台/分离三种报告与 mtime 短路、删除类警告、文本替换警告、
 开头 `&` 剥离与 `python -c`/`node -e` 判别、长输出裁剪保留错误行。

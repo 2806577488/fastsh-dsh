@@ -143,6 +143,28 @@ const textOf = (appended) => appended.map((a) => a.text).join('')
   check('gbk auto pick', text === '中文' && decoder.encoding === 'gbk', JSON.stringify({ text, encoding: decoder.encoding }))
 }
 
+// 7b. mixed encodings in one stream: every line picks its own encoding
+{
+  const gbkLine = Buffer.concat([
+    Buffer.from('arm64-v8a 5 '),
+    Buffer.from([0xb8, 0xf6]), // 个 (GBK)
+    Buffer.from('.so'),
+    Buffer.from([0xce, 0xc4, 0xbc, 0xfe]), // 文件 (GBK)
+    Buffer.from('\n'),
+  ])
+  const decoder = createStreamDecoder('auto')
+  let text = ''
+  text += decoder.push(Buffer.from('√ Built apk\n', 'utf8'))
+  text += decoder.push(gbkLine)
+  text += decoder.flush()
+  check(
+    'mixed stream decodes per line',
+    text.includes('√ Built apk') && text.includes('个.so文件') && !text.includes('\uFFFD'),
+    JSON.stringify(text),
+  )
+  check('mixed stream reports mixed', decoder.encoding === 'mixed', String(decoder.encoding))
+}
+
 // 8. per-job output ring limit is forwarded and clamped
 {
   const mock = mockJobs()

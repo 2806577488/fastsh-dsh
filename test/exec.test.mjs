@@ -386,6 +386,24 @@ function check(name, ok, detail) {
   check('forced cmd bypasses native subset', r.exitCode !== 0, `${r.exitCode} ${JSON.stringify(r.stdout)}`)
 }
 
+// mixed encodings in one buffer (JVM UTF-8 glyph + native GBK line)
+{
+  const buffer = Buffer.concat([
+    Buffer.from('√ Built apk\n', 'utf8'),
+    Buffer.from('arm64-v8a 5 '),
+    Buffer.from([0xb8, 0xf6]), // 个 (GBK)
+    Buffer.from('.so'),
+    Buffer.from([0xce, 0xc4, 0xbc, 0xfe]), // 文件 (GBK)
+    Buffer.from('\n'),
+  ])
+  const r = decodeOutput(buffer)
+  check(
+    'mixed buffer decodes per line',
+    r.text.includes('√ Built apk') && r.text.includes('个.so文件') && !r.text.includes('\uFFFD') && r.encoding === 'mixed',
+    JSON.stringify({ text: r.text, encoding: r.encoding }),
+  )
+}
+
 // 19. 删除类警告：只提醒递归/强制删除，普通删除不吵；提示走现有 warnings 管道
 {
   check('delete warning recursive', detectDeleteRisk('Remove-Item build -Recurse -Force').length === 1, '')
