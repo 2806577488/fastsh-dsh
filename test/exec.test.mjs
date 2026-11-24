@@ -405,6 +405,30 @@ function check(name, ok, detail) {
   )
 }
 
+// 20. watch：mtime+size 都没变时直接复用命令前的哈希，不再整读一遍
+{
+  const target = 'test/tmp-watch-mtime.txt'
+  const fixed = new Date('2026-01-02T03:04:05.000Z')
+  writeFileSync(target, 'AAAA', 'utf8')
+  utimesSync(target, fixed, fixed)
+  const script =
+    `const fs=require('fs');const p='${target}';` +
+    `fs.writeFileSync(p,'BBBB');` +
+    `fs.utimesSync(p,new Date('2026-01-02T03:04:05.000Z'),new Date('2026-01-02T03:04:05.000Z'))`
+  const r = await runCommand({
+    command: `"${process.execPath}" -e "${script}"`,
+    cwd: process.cwd(),
+    watch: [target],
+  })
+  const entry = r.watchReport?.[0]
+  check(
+    'watch mtime short-circuit trusts mtime+size',
+    entry?.changed === false && entry?.after?.sha256 === entry?.before?.sha256,
+    JSON.stringify(entry),
+  )
+  rmSync(target, { force: true })
+}
+
 // 21. 变量路径的删除只能被拒绝，绝不能落到命令里那个字面量目录
 {
   const root = 'test/tmp-var-del'

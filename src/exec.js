@@ -144,13 +144,14 @@ export function normalizeWatchList(value) {
 /**
  * 采样一个文件：sha256 + 字节数。
  * 不存在记 missing，读不到（权限、目录）记 error——采样失败绝不让命令失败。
+ * mtimeMs 只留在内部：命令结束后 mtime+size 没变时直接复用这份哈希。
  */
 function sampleOne(resolved, display) {
   try {
     const stats = statSync(resolved)
     if (!stats.isFile()) return { path: display, resolved, state: 'error', error: 'not a regular file' }
     const sha256 = createHash('sha256').update(readFileSync(resolved)).digest('hex')
-    return { path: display, resolved, state: 'file', sha256, size: stats.size }
+    return { path: display, resolved, state: 'file', sha256, size: stats.size, mtimeMs: stats.mtimeMs }
   } catch (error) {
     if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return { path: display, resolved, state: 'missing' }
     return { path: display, resolved, state: 'error', error: String(error?.code ?? error?.message ?? error) }
@@ -181,9 +182,21 @@ function publicSample(entry, goneWhenMissing) {
  */
 export function finishWatch(snapshot, cwd = process.cwd()) {
   if (!snapshot) return null
-  const after = snapshot.before.map((entry) =>
-    sampleOne(isAbsolute(entry.path) ? entry.path : resolve(cwd, entry.path), entry.path),
-  )
+  const after = snapshot.before.map((entry) => {
+    const resolved = isAbsolute(entry.path) ? entry.path : resolve(cwd, entry.path)
+    // mtime+size 都没变：直接复用命令前的哈希，不再把整个文件读一遍。
+    // 代价是“保住 mtime 且大小不变”的写入会被判为未变化；这是性能换来的，
+    // 与安全路径无关，所以单独成一处、单独提交。
+    if (entry.state === 'file' && entry.mtimeMs !== undefined) {
+      try {
+        const stats = statSync(resolved)
+        if (stats.isFile() && stats.mtimeMs === entry.mtimeMs && stats.size === entry.size) return { ...entry }
+      } catch {
+        /* 走了完整采样，缺失/错误照常记录 */
+      }
+    }
+    return sampleOne(resolved, entry.path)
+  })
   return snapshot.before.map((entry, index) => {
     const next = after[index]
     const changed = entry.state !== next.state || entry.sha256 !== next.sha256 || entry.size !== next.size
