@@ -283,6 +283,19 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 嵌套引号在 cmd / PowerShell 里本来就容易被吞坏，脚本式替换应该走 `write`/`edit`
 或 Python 脚本（失败就 `sys.exit(1)`），别用 shell 拼字符串。
 
+## PATH 覆盖提醒
+
+`set "PATH=..."`（或 `setx PATH`、`$env:PATH = "..."`）如果**没有带上** `%PATH%` /
+`$env:PATH`，会把继承的 PATH 整个换掉，同一行后面的命令就悄悄找不到工具。检测到
+这种整体赋值时，结果最前面加一行：
+
+```
+⚠ PATH 被整体覆盖（未含 %PATH%）：改用 set "PATH=<dir>;%PATH%" 或绝对路径
+```
+
+`setx` 另有单独提示（它会永久改写用户/机器 PATH）。追加写法
+（`...;%PATH%`）不提示。同样只提示、不改执行行为。
+
 ## 删除类警告与 Remove-Item 护栏
 
 删除是唯一会让"一次错误的命令"变成不可逆损失的地方，所以分两层：
@@ -335,14 +348,15 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 
 ## 已验证
 
-在 `test/ps.test.mjs`（91 项）、`test/exec.test.mjs`（67 项）、
+在 `test/ps.test.mjs`（91 项）、`test/exec.test.mjs`（74 项）、
 `test/plugin.test.mjs`（25 项）、`test/jobs.test.mjs`（17 项）与
 `test/perf.test.mjs`（9 项）中覆盖并通过：
 原生 PowerShell 子集（列目录、管道、Where/ForEach、.NET 静态调用、`$env:`、
 Test-Path）与"不支持必须回退"的边界，路径参数里的变量展开（`$HOME`、`$env:X`、
 `$PWD`）与"必须回退"的插值边界，`Remove-Item` 护栏与 `-WhatIf`/空路径语义，
 `Get-FileHash`/`ConvertFrom-Json`/`Resolve-Path`/`Select-Object -Unique`/`Format-Table`
-透传与 `-ErrorAction`（含"护栏拒绝不可抑制"），
+透传与 `-ErrorAction`（含"护栏拒绝不可抑制"），PATH 覆盖提醒（整体赋值/`setx`/
+`$env:PATH`，追加不提示），
 中文 GBK 解码、退出码透传、stderr 分离、
 cwd 生效、引号与 `&` 保真、PowerShell 模式、超时杀树、abort、后台日志、
 BOM/GBK 解码、跨块多字节字符、jobs 的完成/失败/取消、`outputLimitBytes`、
@@ -355,9 +369,10 @@ BOM/GBK 解码、跨块多字节字符、jobs 的完成/失败/取消、`outputL
 - 拒绝/提示信息统一 `fastsh:` 前缀，一句话给"为什么 + 下一步"（如
   `fastsh: 拒绝删除受保护路径 C:\Windows（请改删其下的具体子目录）`），不重复路径。
 - 工具 schema 与系统提示按"每条规则只出现一次"压缩：每轮固定开销约
-  2380 → 1430 tokens（工具描述 346→293、参数 883→445、输出 schema 561→299、
-  提示段 590→395），能力清单与行为规则不删，只去重与收紧措辞。
-- 删除类提醒只在递归/强制删除时出现，普通 `del a.txt` 不占 token。
+  2380 → 1450 tokens（工具描述 346→293、参数 883→445、输出 schema 561→299、
+  提示段 590→415），能力清单与行为规则不删，只去重与收紧措辞。
+- 删除类提醒只在递归/强制删除时出现，普通 `del a.txt` 不占 token；PATH 提醒只在
+  未追加 `%PATH%`/`$env:PATH` 的整体赋值时出现。
 
 ## 已知边界
 

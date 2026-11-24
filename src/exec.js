@@ -544,6 +544,43 @@ export function detectDeleteRisk(command) {
 }
 
 // ---------------------------------------------------------------------------
+// PATH 覆盖提醒
+// ---------------------------------------------------------------------------
+
+/** `set "PATH=..."` at command position; the capture is the assigned value. */
+const PATH_SET = /(?:^|[&|;]\s*)set\s+"?PATH=([^"&|]*)"?/i
+/** `setx PATH` is worse than `set`: it rewrites the persistent user/machine PATH. */
+const PATH_SETX = /(?:^|[&|;]\s*)setx\s+(?:\/m\s+)?PATH\b/i
+/** PowerShell form: `$env:PATH = "..."`. */
+const PATH_ASSIGN = /\$env:PATH\s*=/i
+
+/**
+ * A whole-line PATH assignment drops every inherited entry, so later commands
+ * on the same line silently lose tools. Appending `;%PATH%` keeps them. This
+ * only warns; the command still runs.
+ */
+export function detectPathOverwrite(command) {
+  if (typeof command !== 'string' || command === '') return []
+  const warnings = []
+  if (PATH_SETX.test(command)) {
+    warnings.push('⚠ setx 会永久改写 PATH：当前进程用 set "PATH=<dir>;%PATH%" 追加即可')
+  }
+  const set = command.match(PATH_SET)
+  if (set && !/%PATH%/i.test(set[1])) {
+    warnings.push('⚠ PATH 被整体覆盖（未含 %PATH%）：改用 set "PATH=<dir>;%PATH%" 或绝对路径')
+  }
+  const assign = command.search(PATH_ASSIGN)
+  if (assign >= 0) {
+    const rest = command.slice(assign)
+    const afterEquals = rest.slice(rest.indexOf('=') + 1)
+    if (!/\$env:PATH/i.test(afterEquals)) {
+      warnings.push('⚠ PATH 被整体覆盖（未含 $env:PATH）：改用 "$env:PATH;<dir>" 或绝对路径')
+    }
+  }
+  return warnings
+}
+
+// ---------------------------------------------------------------------------
 // Native engine isolation
 // ---------------------------------------------------------------------------
 
@@ -688,7 +725,11 @@ export function runCommand(request, signal) {
 
   // 采样必须在命令启动之前完成，所以放在任何异步分支之前。
   const watchSnapshot = snapshotWatch(watch, cwd)
-  const warnings = [...detectTextReplacement(request.command), ...detectDeleteRisk(request.command)]
+  const warnings = [
+    ...detectTextReplacement(request.command),
+    ...detectDeleteRisk(request.command),
+    ...detectPathOverwrite(request.command),
+  ]
   const finalizeResult = (result) => {
     let out = result
     if (watchSnapshot) {

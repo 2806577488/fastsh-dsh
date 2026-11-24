@@ -4,6 +4,7 @@ import {
   decodeOutput,
   detectPowerShell,
   detectDeleteRisk,
+  detectPathOverwrite,
   formatWatchReport,
   startBackgroundJob,
 } from '../src/exec.js'
@@ -443,6 +444,24 @@ function check(name, ok, detail) {
     JSON.stringify({ exit: r.exitCode, stderr: r.stderr.slice(0, 80) }),
   )
   rmSync(root, { recursive: true, force: true })
+}
+
+// 22. PATH 覆盖提醒：整体赋值丢继承条目，追加才保留
+{
+  check('path warning whole overwrite', detectPathOverwrite('set "PATH=C:\\a;C:\\Windows\\system32"').length === 1, '')
+  check('path warning append is fine', detectPathOverwrite('set "PATH=C:\\a;%PATH%"').length === 0, '')
+  check('path warning setx', detectPathOverwrite('setx PATH "C:\\a"').length === 1, '')
+  check('path warning powershell overwrite', detectPathOverwrite('$env:PATH = "C:\\a"').length === 1, '')
+  check('path warning powershell append', detectPathOverwrite('$env:PATH = "C:\\a;$env:PATH"').length === 0, '')
+  check('path warning ignores echo', detectPathOverwrite('echo set PATH=x').length === 0, '')
+}
+{
+  const r = await runCommand({ command: 'set "PATH=C:\\Windows\\system32" && ver', cwd: 'C:\\Windows' })
+  check(
+    'path warning surfaces in result',
+    Array.isArray(r.warnings) && r.warnings.some((w) => w.includes('PATH')),
+    JSON.stringify(r.warnings),
+  )
 }
 
 const failed = results.filter((r) => !r.ok)
