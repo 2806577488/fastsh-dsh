@@ -189,6 +189,18 @@ const signal = new AbortController().signal
   check('timeout flag', value.timedOut === true, `${value.durationMs}ms`)
 }
 
+// every request pays for the tool schema, so keep the fixed context cost lean
+{
+  const size = (value) => JSON.stringify(value).length
+  const prompt = sections.map((s) => s.text).join('')
+  const total = prompt.length + definition.description.length + size(definition.parameters) + size(definition.output.schema)
+  check(
+    'context budget stays lean',
+    total <= 6500 && definition.description.length <= 1300 && size(definition.parameters) <= 2000 && size(definition.output.schema) <= 1300,
+    `${total} chars`,
+  )
+}
+
 console.log('PASS:\n  ' + ok.join('\n  '))
 if (bad.length) {
   console.log('FAIL:\n  ' + bad.join('\n  '))
