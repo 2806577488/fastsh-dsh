@@ -21,6 +21,7 @@ import {
   readSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -31,10 +32,18 @@ import { randomUUID } from 'node:crypto'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 
 const UNSUPPORTED = Symbol('fastsh.ps.unsupported')
+const REFUSED = Symbol('fastsh.ps.refused')
 
 function nope(reason) {
   const error = new Error(reason)
   error[UNSUPPORTED] = true
+  throw error
+}
+
+/** A safety refusal: `-ErrorAction SilentlyContinue` must never hide it. */
+function refuse(reason) {
+  const error = new Error(reason)
+  error[REFUSED] = true
   throw error
 }
 
@@ -155,10 +164,128 @@ function parseStage(stage) {
   return { name: tokens[0].toLowerCase(), params, positional }
 }
 
+/**
+ * Resolve one path argument.
+ *
+ * Paths are where variables actually matter (`"$HOME\out"`, `$env:TEMP\x`), so
+ * an exact reference expands exactly like valueOf does. A token that still
+ * holds a `$` reference afterwards cannot be interpolated faithfully here:
+ * decline to the real engine instead of silently using a literal directory
+ * named `$HOME`.
+ */
 function toPath(value, context) {
-  const raw = String(value ?? '')
-  if (raw === '' || raw === '.') return context.cwd
-  return isAbsolute(raw) ? raw : resolve(context.cwd, raw)
+  const raw = typeof value === 'string' ? value : String(value ?? '')
+  if (raw === '') return context.cwd
+  const expanded = typeof value === 'string' ? valueOf(value, context) : value
+  const text = String(expanded ?? '')
+  // A missing $env:/$HOME expands to '' in string context; as a path that would
+  // silently become the working directory, which is never what the caller meant.
+  if (text === '') nope(`path resolves to nothing: ${raw}`)
+  if (text.includes('$')) nope(`path interpolation: ${text}`)
+  if (text === '.') return context.cwd
+  return isAbsolute(text) ? text : resolve(context.cwd, text)
+}
+
+/** Case-insensitive, separator-normalised form used by the delete guard. */
+function comparablePath(path) {
+  const resolved = resolve(path)
+  return resolved.replace(/[\\/]+$/, '').toLowerCase()
+}
+
+/**
+ * Resolve a delete target without guessing.
+ *
+ * The guard can only protect paths it can see, so a variable that does not
+ * resolve exactly, a wildcard, or an empty target is refused here. Falling
+ * back to the real engine would be "faithful" but would delete without the
+ * guard, and a variable that quietly resolves elsewhere is precisely how a
+ * delete lands on the wrong target.
+ */
+function strictDeletePath(value, context, { literal = false } = {}) {
+  const raw = typeof value === 'string' ? value : ''
+  if (raw === '') refuse('fastsh: 拒绝删除：缺少路径')
+  let expanded
+  try {
+    expanded = valueOf(raw, context)
+  } catch (error) {
+    if (error && error[UNSUPPORTED]) {
+      refuse(`fastsh: 拒绝删除：无法解析路径 ${raw}（请改用绝对路径）`)
+    }
+    throw error
+  }
+  if (typeof expanded !== 'string' || expanded === '') {
+    refuse(`fastsh: 拒绝删除：无法解析路径 ${raw}（变量为空或未赋值）`)
+  }
+  // String interpolation (`"$HOME\out"`), wildcard expansion and friends only
+  // exist in the real engine; the native guard cannot see their result.
+  if (expanded.includes('$')) {
+    refuse(`fastsh: 拒绝删除：路径含变量插值 ${expanded}（请改用绝对路径）`)
+  }
+  // `-LiteralPath` explicitly promises no wildcard expansion, so `*` there is
+  // an ordinary file-name character.
+  if (!literal && /[*?]/.test(expanded)) {
+    refuse(`fastsh: 拒绝删除：路径含通配符 ${expanded}（请先列目录再逐个删）`)
+  }
+  return isAbsolute(expanded) ? expanded : resolve(context.cwd, expanded)
+}
+
+/** True when `path` and `root` name the same location. */
+function samePath(path, root) {
+  return comparablePath(path) === comparablePath(root)
+}
+
+/** True when `path` is strictly above `root`, e.g. C:\Users above a profile. */
+function isAbove(path, root) {
+  const above = comparablePath(path)
+  const below = comparablePath(root)
+  if (above === below) return false
+  return below.startsWith(above.endsWith('\\') ? above : `${above}\\`)
+}
+
+/**
+ * Delete guard: only the statically determinable roots are refused, because
+ * those are the ones whose loss is never the caller's intent. Their normal
+ * subdirectories stay deletable (`Remove-Item build -Recurse` keeps working).
+ */
+export function guardDelete(path, context) {
+  const env = context.env ?? {}
+  const systemRoot = env.SystemRoot ?? env.windir ?? ''
+  const roots = [
+    env.SystemDrive,
+    env.SystemRoot,
+    env.windir,
+    systemRoot ? join(systemRoot, 'System32') : '',
+    systemRoot ? join(systemRoot, 'SysWOW64') : '',
+    env.ProgramFiles,
+    env['ProgramFiles(x86)'],
+    env.ProgramData,
+    env.USERPROFILE,
+    env.DSH_HOME,
+    env.DSH_PROFILE_DIR,
+    env.DSH_INSTALL_DIR,
+    context.cwd,
+  ].filter((root) => typeof root === 'string' && root.trim() !== '')
+
+  const resolved = resolve(path)
+  // A junction can point at a protected root, so compare what the OS actually
+  // resolves the path to as well as the literal path.
+  let actual = resolved
+  try {
+    actual = realpathSync(resolved)
+  } catch {
+    /* Not created yet: the literal path is all there is. */
+  }
+  for (const target of [resolved, actual]) {
+    for (const root of roots) {
+      // The root itself, or anything above it: both take the root with them.
+      if (samePath(target, root) || isAbove(target, root)) {
+        refuse(`fastsh: 拒绝删除受保护路径 ${target}（请改删其下的具体子目录）`)
+      }
+    }
+    if (/^[A-Za-z]:$/.test(target) || /^\\\\[^\\]+\\[^\\]+$/.test(target)) {
+      refuse(`fastsh: 拒绝删除盘符/共享根 ${target}`)
+    }
+  }
 }
 
 function shapeItem(path) {
@@ -339,7 +466,13 @@ function valueOf(token, context) {
   if (token === '$false' || token === '$False') return false
   if (token === '$null' || token === '$Null') return null
   if (token === '$PWD' || token === '$pwd') return context.cwd
-  if (token === '$HOME' || token === '$home') return context.env.USERPROFILE ?? context.env.HOME ?? ''
+  if (token === '$HOME' || token === '$home') {
+    // PowerShell always defines $HOME; an empty substitute would silently turn
+    // `Remove-Item $HOME\x` into a relative path, so decline to the real engine.
+    const home = context.env.USERPROFILE || context.env.HOME
+    if (!home) nope('$HOME is not available')
+    return home
+  }
   if (token === '$_') return context.loop
   const envMatch = token.match(/^\$env:([A-Za-z_][A-Za-z0-9_]*)$/)
   if (envMatch) return context.env[envMatch[1]] ?? ''
@@ -348,6 +481,12 @@ function valueOf(token, context) {
   // Property chains on a variable: `$item.Name`.
   if (/^\$[A-Za-z_][\w:]*(?:\.[A-Za-z_]\w*)+$/.test(token)) return resolveReference(token, context)
   return token
+}
+
+/** PowerShell pipelines carry one item or many; array stages need one shape. */
+function pipelineValues(input) {
+  if (input === undefined) return []
+  return Array.isArray(input) ? input : [input]
 }
 
 function param(params, ...names) {
@@ -506,7 +645,23 @@ function runCmdlet(stage, input, context) {
     case 'rm':
     case 'del':
     case 'erase': {
-      const path = toPath(param(params, 'path') ?? args[0], context)
+      const flags = [...params.keys()]
+      const flagOn = (name) => flags.some((key) => key === name || key === `${name}:$true`)
+      // -WhatIf never deletes; let the real engine print its what-if lines.
+      if (flagOn('whatif')) nope('Remove-Item -WhatIf')
+      // -Confirm asks a human; there is no console here, so refuse instead of
+      // guessing (deleting is the unsafe guess).
+      if (flagOn('confirm')) {
+        refuse('fastsh: 无交互确认，请用 -WhatIf 预览后去掉 -Confirm')
+      }
+      const literal = param(params, 'literalpath')
+      const target = literal ?? param(params, 'path') ?? args[0]
+      // Pipeline input is PowerShell's own idiom; the real engine owns it.
+      if (target === undefined && input !== undefined) nope('Remove-Item from pipeline')
+      // Everything below refuses rather than falls back: a delete that leaves
+      // the native guard is a delete nobody checked.
+      const path = strictDeletePath(target, context, { literal: literal !== undefined })
+      guardDelete(path, context)
       // Removing a junction must unlink the link, never recurse into its target.
       if (lstatSync(path).isSymbolicLink()) unlinkSync(path)
       else rmSync(path, { recursive: truthy(params.get('recurse')), force: truthy(params.get('force')) })
@@ -627,7 +782,7 @@ function runCmdlet(stage, input, context) {
       return args.map((arg) => String(valueOf(arg, context))).join(' ')
     case 'select-object':
     case 'select': {
-      let values = input ?? []
+      let values = pipelineValues(input)
       const skip = param(params, 'skip')
       if (skip !== undefined) values = values.slice(Number(valueOf(skip, context)))
       const first = param(params, 'first')
@@ -655,14 +810,14 @@ function runCmdlet(stage, input, context) {
     case '?': {
       const block = param(params, 'filterscript') ?? args[0]
       if (!block) nope('where-object without a filter')
-      return (input ?? []).filter((value) => truthy(runScriptBlock(block, value, context)))
+      return pipelineValues(input).filter((value) => truthy(runScriptBlock(block, value, context)))
     }
     case 'foreach-object':
     case 'foreach':
     case '%': {
       const block = param(params, 'process') ?? args[0]
       if (!block) nope('foreach-object without a block')
-      return (input ?? []).map((value) => runScriptBlock(block, value, context))
+      return pipelineValues(input).map((value) => runScriptBlock(block, value, context))
     }
     case 'sort-object':
     case 'sort': {
@@ -671,7 +826,7 @@ function runCmdlet(stage, input, context) {
         .map((key) => key.trim())
         .filter(Boolean)
       const descending = truthy(params.get('descending'))
-      const sorted = [...(input ?? [])]
+      const sorted = [...pipelineValues(input)]
       sorted.sort((a, b) => {
         for (const key of keys) {
           const left = a?.[key]
@@ -685,7 +840,7 @@ function runCmdlet(stage, input, context) {
     }
     case 'measure-object':
     case 'measure': {
-      const values = input ?? []
+      const values = pipelineValues(input)
       const property = param(params, 'property')
       const numbers = property
         ? values.map((value) => Number(value?.[String(valueOf(property, context))])).filter((n) => Number.isFinite(n))
@@ -724,9 +879,12 @@ function callDotNet(expression, context) {
         case 'appendalltext':
           appendFileSync(toPath(args[0], context), String(args[1] ?? ''), 'utf8')
           return ''
-        case 'delete':
-          rmSync(toPath(args[0], context), { force: true })
+        case 'delete': {
+          const path = strictDeletePath(args[0], context)
+          guardDelete(path, context)
+          rmSync(path, { force: true })
           return ''
+        }
         case 'copy':
           cpSync(toPath(args[0], context), toPath(args[1], context))
           return ''
@@ -750,6 +908,21 @@ function callDotNet(expression, context) {
           return listChildren(toPath(args[0], context), { recurse: false }).filter((item) => item.PSIsContainer).map((item) => item.FullName)
         case 'getcurrentdirectory':
           return context.cwd
+        case 'delete': {
+          // Same strict resolution + guard as Remove-Item: a variable that does
+          // not resolve exactly must not turn into a delete.
+          const path = strictDeletePath(args[0], context)
+          guardDelete(path, context)
+          const recursive = args[1] === true || args[1] === 1 || String(args[1]).toLowerCase() === 'true'
+          // .NET throws when the target is not a directory; do not fall back to
+          // deleting a file that happened to share the name.
+          if (!statSync(path).isDirectory()) {
+            throw new Error(`fastsh: 拒绝删除：${path} 不是目录`)
+          }
+          if (recursive) rmSync(path, { recursive: true, force: false })
+          else rmdirSync(path)
+          return ''
+        }
         default:
           nope(`Directory.${member}`)
       }

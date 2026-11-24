@@ -3,10 +3,12 @@ import {
   runInBackground,
   decodeOutput,
   detectPowerShell,
+  detectDeleteRisk,
   formatWatchReport,
   startBackgroundJob,
 } from '../src/exec.js'
-import { readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
+import { readFileSync, existsSync, mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 // Fixtures are addressed from the package root.
@@ -381,6 +383,42 @@ function check(name, ok, detail) {
 {
   const r = await runCommand({ command: 'Write-Output hi', shell: 'cmd', cwd: 'C:\\Windows' })
   check('forced cmd bypasses native subset', r.exitCode !== 0, `${r.exitCode} ${JSON.stringify(r.stdout)}`)
+}
+
+// 19. 删除类警告：只提醒递归/强制删除，普通删除不吵；提示走现有 warnings 管道
+{
+  check('delete warning recursive', detectDeleteRisk('Remove-Item build -Recurse -Force').length === 1, '')
+  check('delete warning cmd /s', detectDeleteRisk('rd /s /q build').length === 1, '')
+  check('delete warning quiet delete', detectDeleteRisk('del a.txt').length === 0, '')
+  check('delete warning no false positive', detectDeleteRisk('echo del /s').length === 0, '')
+}
+{
+  const target = 'test/tmp-warn-del'
+  rmSync(target, { recursive: true, force: true })
+  mkdirSync(target, { recursive: true })
+  writeFileSync(`${target}/a.txt`, 'x', 'utf8')
+  const r = await runCommand({ command: `Remove-Item ${target} -Recurse -Force`, cwd: process.cwd() })
+  check(
+    'delete warning surfaces in result',
+    Array.isArray(r.warnings) && r.warnings.some((w) => w.includes('删除类命令')) && !existsSync(target),
+    JSON.stringify(r.warnings),
+  )
+}
+
+// 21. 变量路径的删除只能被拒绝，绝不能落到命令里那个字面量目录
+{
+  const root = 'test/tmp-var-del'
+  const literal = `${root}/$HOME/x`
+  rmSync(root, { recursive: true, force: true })
+  mkdirSync(literal, { recursive: true })
+  writeFileSync(`${literal}/keep.txt`, 'x', 'utf8')
+  const r = await runCommand({ command: 'Remove-Item "$HOME\\x" -Recurse -Force', cwd: resolve(root) })
+  check(
+    'variable path deletes nothing',
+    r.exitCode === 1 && /拒绝删除/.test(r.stderr) && existsSync(`${literal}/keep.txt`),
+    JSON.stringify({ exit: r.exitCode, stderr: r.stderr.slice(0, 80) }),
+  )
+  rmSync(root, { recursive: true, force: true })
 }
 
 const failed = results.filter((r) => !r.ok)

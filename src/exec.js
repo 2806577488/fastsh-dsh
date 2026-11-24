@@ -504,7 +504,30 @@ export function detectTextReplacement(command) {
   const multiline = /[\r\n]/.test(command)
   const quotes = (command.match(/["']/g) ?? []).length
   if (!multiline && quotes < 3) return []
-  return ['⚠ 疑似 shell 文本替换：建议改用 edit 工具或 Python 脚本（sys.exit(1) 卡 MISS）。']
+  return ['⚠ 疑似 shell 文本替换：改用 edit 工具或 Python（sys.exit(1)）']
+}
+
+// ---------------------------------------------------------------------------
+// 删除类命令的提醒
+// ---------------------------------------------------------------------------
+
+/** 命令位置上的删除动词（行首，或 `|`、`;`、`&` 之后的一级命令）。 */
+const DELETE_COMMAND =
+  /(?:^|[|;&]\s*)(?:Remove-Item|rm|del|erase|rd|rmdir|\[System\.IO\.(?:File|Directory)\]::Delete)\b/i
+/** 递归删除：PowerShell 的 -Recurse、cmd 的 /s。 */
+const DELETE_RECURSIVE = /(?:^|\s)-recurse\b|\/s\b/i
+/** 强制/静默删除：PowerShell 的 -Force、cmd 的 /f 与 /q。 */
+const DELETE_FORCE = /(?:^|\s)-force\b|\/[fq]\b/i
+
+/**
+ * 递归或强制删除是唯一值得在结果最前面提醒的删除形态；普通 `del a.txt`
+ * 不提示，否则每次清临时文件都多一行噪音。只提示，不改执行行为。
+ */
+export function detectDeleteRisk(command) {
+  if (typeof command !== 'string' || command === '') return []
+  if (!DELETE_COMMAND.test(command)) return []
+  if (!DELETE_RECURSIVE.test(command) && !DELETE_FORCE.test(command)) return []
+  return ['⚠ 删除类命令（递归/强制）：确认目标是产物或临时目录']
 }
 
 // ---------------------------------------------------------------------------
@@ -652,7 +675,7 @@ export function runCommand(request, signal) {
 
   // 采样必须在命令启动之前完成，所以放在任何异步分支之前。
   const watchSnapshot = snapshotWatch(watch, cwd)
-  const warnings = detectTextReplacement(request.command)
+  const warnings = [...detectTextReplacement(request.command), ...detectDeleteRisk(request.command)]
   const finalizeResult = (result) => {
     let out = result
     if (watchSnapshot) {

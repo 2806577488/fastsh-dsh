@@ -3,7 +3,8 @@
  * outside the subset must return null so the caller falls back to PowerShell.
  */
 import { runNativePowerShell } from '../src/ps.js'
-import { existsSync, lstatSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { basename, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 // Fixtures are addressed from the package root.
@@ -63,6 +64,228 @@ const check = (name, cond, detail) => (cond ? ok : bad).push(`${name} ${detail ?
 {
   const r = run('$env:USERPROFILE')
   check('env var', r && r.stdout === (process.env.USERPROFILE ?? ''), JSON.stringify(r?.stdout))
+}
+
+// variables in path arguments: exact references expand, anything that still
+// needs interpolation must decline to the real engine instead of going literal
+{
+  const r = run('Test-Path $HOME')
+  check('path expands $HOME', r && r.stdout === 'True', JSON.stringify(r?.stdout))
+}
+{
+  const r = run('Test-Path $env:USERPROFILE')
+  check('path expands $env:USERPROFILE', r && r.stdout === 'True', JSON.stringify(r?.stdout))
+}
+{
+  const r = run('Get-Item $HOME | Select-Object -ExpandProperty Name')
+  check(
+    'path expands $HOME for Get-Item',
+    r && r.stdout.trim() === basename(process.env.USERPROFILE ?? ''),
+    JSON.stringify(r?.stdout),
+  )
+}
+{
+  const r = run('Get-Item $PWD | Select-Object -ExpandProperty FullName')
+  check('path expands $PWD', r && r.stdout.trim() === process.cwd(), JSON.stringify(r?.stdout))
+}
+{
+  const r = run('Test-Path "$HOME\\."')
+  check('embedded $reference declines to the real engine', r === null, JSON.stringify(r))
+}
+{
+  const r = run('Test-Path $env:USERPROFILE\\Documents')
+  check('embedded $env reference declines to the real engine', r === null, JSON.stringify(r))
+}
+{
+  const r = runNativePowerShell('Write-Output $HOME', { cwd: process.cwd(), env: {} })
+  check('$HOME without env declines', r === null, JSON.stringify(r))
+}
+{
+  const r = runNativePowerShell('Test-Path $HOME', { cwd: process.cwd(), env: {} })
+  check('$HOME path without env declines', r === null, JSON.stringify(r))
+}
+{
+  const r = runNativePowerShell('Test-Path $env:NO_SUCH_VAR_FASTSH', { cwd: process.cwd(), env: {} })
+  check('missing $env in a path declines', r === null, JSON.stringify(r))
+}
+
+// Remove-Item: the guard refuses protected roots, and a delete target that a
+// variable could still move is refused instead of handed to the real engine.
+{
+  const root = 'test/tmp-guard'
+  rmSync(root, { recursive: true, force: true })
+  mkdirSync(`${root}/sub`, { recursive: true })
+  writeFileSync(`${root}/sub/a.txt`, 'x', 'utf8')
+  writeFileSync(`${root}/w.txt`, 'x', 'utf8')
+  const ctx = { cwd: resolve(root), env: { ...process.env, USERPROFILE: resolve(root) } }
+
+  const blocked = runNativePowerShell(`Remove-Item "${resolve(root)}" -Recurse -Force`, ctx)
+  check(
+    'guard blocks the profile root',
+    blocked && blocked.exitCode === 1 && /拒绝删除受保护路径/.test(blocked.stderr),
+    JSON.stringify(blocked),
+  )
+  check('guard left the tree intact', existsSync(`${root}/sub/a.txt`), '')
+
+  const blockedCwd = runNativePowerShell('Remove-Item . -Recurse -Force', ctx)
+  check(
+    'guard blocks the working directory',
+    blockedCwd && blockedCwd.exitCode === 1 && /拒绝删除受保护路径/.test(blockedCwd.stderr),
+    JSON.stringify(blockedCwd),
+  )
+
+  const allowed = runNativePowerShell('Remove-Item sub -Recurse -Force', ctx)
+  check(
+    'guard allows a subdirectory',
+    allowed && allowed.exitCode === 0 && !existsSync(`${root}/sub`),
+    JSON.stringify(allowed),
+  )
+
+  const whatif = runNativePowerShell('Remove-Item w.txt -WhatIf', ctx)
+  check('whatif declines instead of deleting', whatif === null && existsSync(`${root}/w.txt`), JSON.stringify(whatif))
+
+  const confirm = runNativePowerShell('Remove-Item w.txt -Confirm', ctx)
+  check(
+    'confirm is refused instead of deleting',
+    confirm && confirm.exitCode === 1 && /交互确认/.test(confirm.stderr) && existsSync(`${root}/w.txt`),
+    JSON.stringify(confirm),
+  )
+
+  const whatifFalse = runNativePowerShell('Remove-Item w.txt -WhatIf:$false', ctx)
+  check(
+    'whatif:$false still deletes under the guard',
+    whatifFalse && whatifFalse.exitCode === 0 && !existsSync(`${root}/w.txt`),
+    JSON.stringify(whatifFalse),
+  )
+
+  writeFileSync(`${root}/w.txt`, 'x', 'utf8')
+  const noPath = runNativePowerShell('Remove-Item -Recurse -Force', ctx)
+  check(
+    'missing -Path is refused instead of deleting cwd',
+    noPath && noPath.exitCode === 1 && existsSync(`${root}/w.txt`),
+    JSON.stringify(noPath),
+  )
+
+  const piped = runNativePowerShell('Get-ChildItem w.txt | Remove-Item -Force', ctx)
+  check('pipeline input declines to the real engine', piped === null, JSON.stringify(piped))
+
+  // The exact wrong-deletion shape: `"$HOME\x"` used to resolve to the literal
+  // directory `$HOME\x` under the working directory and delete that instead.
+  const literal = `${root}/$HOME/x`
+  mkdirSync(literal, { recursive: true })
+  writeFileSync(`${literal}/keep.txt`, 'x', 'utf8')
+  const interpolated = runNativePowerShell('Remove-Item "$HOME\\x" -Recurse -Force', ctx)
+  check(
+    'variable path never deletes the literal $HOME directory',
+    interpolated && interpolated.exitCode === 1 && existsSync(`${literal}/keep.txt`),
+    JSON.stringify(interpolated),
+  )
+
+  const wildcardDir = `${root}/wc`
+  mkdirSync(wildcardDir, { recursive: true })
+  writeFileSync(`${wildcardDir}/keep.txt`, 'x', 'utf8')
+  const wildcard = runNativePowerShell('Remove-Item wc\\* -Recurse -Force', ctx)
+  check(
+    'wildcard path is refused instead of expanding',
+    wildcard && wildcard.exitCode === 1 && existsSync(`${wildcardDir}/keep.txt`),
+    JSON.stringify(wildcard),
+  )
+
+  const nested = `${root}/nested/leaf`
+  mkdirSync(nested, { recursive: true })
+  const ancestor = runNativePowerShell('Remove-Item .. -Recurse -Force', {
+    cwd: resolve(nested),
+    env: { ...process.env, USERPROFILE: resolve(nested) },
+  })
+  check(
+    'guard blocks an ancestor of the working directory',
+    ancestor && ancestor.exitCode === 1 && /拒绝删除受保护路径/.test(ancestor.stderr),
+    JSON.stringify(ancestor),
+  )
+
+  // Exact variables still delete the target they name; the guard sees the value.
+  const assigned = resolve(`${root}/assigned`)
+  mkdirSync(assigned, { recursive: true })
+  writeFileSync(`${assigned}/keep.txt`, 'x', 'utf8')
+  const assignedDelete = runNativePowerShell(`$d = "${assigned}"; Remove-Item $d -Recurse -Force`, ctx)
+  check(
+    'assigned variable deletes the resolved target',
+    assignedDelete && assignedDelete.exitCode === 0 && !existsSync(assigned),
+    JSON.stringify(assignedDelete),
+  )
+
+  const fileDelete = runNativePowerShell('[System.IO.File]::Delete($env:NO_SUCH_VAR_FASTSH)', ctx)
+  check(
+    'File.Delete with an empty variable is refused',
+    fileDelete && fileDelete.exitCode === 1 && /拒绝删除/.test(fileDelete.stderr),
+    JSON.stringify(fileDelete),
+  )
+
+  // Directory.Delete is native now, so the same guard applies instead of a
+  // silent fallback to the real engine.
+  const dirTarget = `${root}/dir-del`
+  mkdirSync(`${dirTarget}/inner`, { recursive: true })
+  writeFileSync(`${dirTarget}/inner/x.txt`, 'x', 'utf8')
+  const dirDelete = runNativePowerShell(`[System.IO.Directory]::Delete("${resolve(dirTarget)}", $true)`, ctx)
+  check(
+    'Directory.Delete removes a subdirectory',
+    dirDelete && dirDelete.exitCode === 0 && !existsSync(dirTarget),
+    JSON.stringify(dirDelete),
+  )
+  const dirDeleteProtected = runNativePowerShell(`[System.IO.Directory]::Delete("${resolve(root)}", $true)`, ctx)
+  check(
+    'Directory.Delete is guarded',
+    dirDeleteProtected &&
+      dirDeleteProtected.exitCode === 1 &&
+      /拒绝删除受保护路径/.test(dirDeleteProtected.stderr) &&
+      existsSync(root),
+    JSON.stringify(dirDeleteProtected),
+  )
+  const dirDeleteVar = runNativePowerShell('[System.IO.Directory]::Delete($env:NO_SUCH_VAR_FASTSH, $true)', ctx)
+  check(
+    'Directory.Delete with an empty variable is refused',
+    dirDeleteVar && dirDeleteVar.exitCode === 1 && /拒绝删除/.test(dirDeleteVar.stderr),
+    JSON.stringify(dirDeleteVar),
+  )
+  writeFileSync(`${root}/lp2.txt`, 'x', 'utf8')
+  const dirDeleteFile = runNativePowerShell(`[System.IO.Directory]::Delete("${resolve(`${root}/lp2.txt`)}", $true)`, ctx)
+  check(
+    'Directory.Delete on a file fails without deleting it',
+    dirDeleteFile && dirDeleteFile.exitCode === 1 && existsSync(`${root}/lp2.txt`),
+    JSON.stringify(dirDeleteFile),
+  )
+
+  // -Path refuses wildcards before touching the filesystem; -LiteralPath is a
+  // valid target source and still goes through the guard.
+  const wildcardPath = runNativePowerShell('Remove-Item -Path a*b.txt -Force', ctx)
+  check(
+    'wildcard -Path is refused',
+    wildcardPath && wildcardPath.exitCode === 1 && /通配符/.test(wildcardPath.stderr),
+    JSON.stringify(wildcardPath),
+  )
+  writeFileSync(`${root}/lp.txt`, 'x', 'utf8')
+  const literalPath = runNativePowerShell('Remove-Item -LiteralPath "lp.txt" -Force', ctx)
+  check(
+    'literalpath deletes a plain literal name',
+    literalPath && literalPath.exitCode === 0 && !existsSync(`${root}/lp.txt`),
+    JSON.stringify(literalPath),
+  )
+
+  // A .Property chain resolves to a real path and stays under the guard.
+  const fe = `${root}/fe`
+  mkdirSync(fe, { recursive: true })
+  writeFileSync(`${fe}/f1.txt`, 'x', 'utf8')
+  writeFileSync(`${fe}/f2.txt`, 'x', 'utf8')
+  const viaProperty = runNativePowerShell(
+    `foreach ($f in Get-ChildItem "${resolve(fe)}") { Remove-Item $f.FullName -Force }`,
+    ctx,
+  )
+  check(
+    'foreach .FullName deletes the resolved files',
+    viaProperty && viaProperty.exitCode === 0 && !existsSync(`${fe}/f1.txt`) && !existsSync(`${fe}/f2.txt`),
+    JSON.stringify(viaProperty),
+  )
+  rmSync(root, { recursive: true, force: true })
 }
 
 // content
