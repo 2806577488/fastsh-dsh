@@ -4,6 +4,7 @@
  */
 import { runNativePowerShell } from '../src/ps.js'
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { basename, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -483,6 +484,83 @@ const check = (name, cond, detail) => (cond ? ok : bad).push(`${name} ${detail ?
   const elapsed = Date.now() - started
   check('select-string streams', r && r.stdout.split('\n').length === 200000 && elapsed < 3000, `${elapsed}ms, ${r?.stdout?.split('\n').length} matches`)
   rmSync(target, { force: true })
+}
+
+// sugar: cmdlets that used to need a pile of statements (or a real PowerShell boot)
+{
+  const expected = createHash('sha256').update(readFileSync('package.json')).digest('hex').toUpperCase()
+  const r = run('Get-FileHash package.json')
+  const parsed = r && JSON.parse(r.stdout)
+  check(
+    'get-filehash sha256',
+    parsed && parsed.Algorithm === 'SHA256' && parsed.Hash === expected,
+    JSON.stringify(parsed && { algorithm: parsed.Algorithm, hash: parsed.Hash?.slice(0, 12) }),
+  )
+  const md5 = run('Get-FileHash package.json -Algorithm MD5')
+  const md5Expected = createHash('md5').update(readFileSync('package.json')).digest('hex').toUpperCase()
+  check('get-filehash md5', md5 && JSON.parse(md5.stdout).Hash === md5Expected, JSON.stringify(md5 && md5.stdout.slice(0, 60)))
+}
+{
+  const multi = run('Get-ChildItem test -File | Get-FileHash')
+  check(
+    'get-filehash from pipeline',
+    multi && multi.stdout.split('\n').length >= 2 && multi.stdout.includes('"Algorithm"'),
+    JSON.stringify(multi && multi.stdout.split('\n').length),
+  )
+}
+{
+  const r = run('echo \'{"a":1,"b":[2]}\' | ConvertFrom-Json')
+  check('convertfrom-json inline', r && r.stdout.replace(/\s+/g, '') === '{"a":1,"b":[2]}', JSON.stringify(r?.stdout))
+  const target = 'test/tmp-json.json'
+  writeFileSync(target, '{\n  "name": "fastsh",\n  "n": 1\n}\n', 'utf8')
+  const fromFile = run(`Get-Content "${target}" | ConvertFrom-Json`)
+  check(
+    'convertfrom-json from file lines',
+    fromFile && fromFile.stdout.replace(/\s+/g, '') === '{"name":"fastsh","n":1}',
+    JSON.stringify(fromFile?.stdout),
+  )
+  rmSync(target, { force: true })
+  const broken = run('echo \'{oops}\' | ConvertFrom-Json')
+  check('convertfrom-json rejects bad json', broken && broken.exitCode === 1 && /JSON 解析失败/.test(broken.stderr), JSON.stringify(broken))
+}
+{
+  const r = run('Resolve-Path .')
+  check('resolve-path', r && r.stdout.trim() === process.cwd(), JSON.stringify(r?.stdout))
+  const missing = run('Resolve-Path no-such-xyz')
+  check('resolve-path missing errors', missing && missing.exitCode === 1, JSON.stringify(missing))
+}
+{
+  const target = 'test/tmp-dup.txt'
+  writeFileSync(target, 'a\nb\na\n', 'utf8')
+  const unique = run(`Get-Content "${target}" | Select-Object -Unique`)
+  check('select-object -unique', unique && unique.stdout === 'a\nb', JSON.stringify(unique?.stdout))
+  rmSync(target, { force: true })
+}
+{
+  const plain = run('Get-ChildItem test -Name')
+  const formatted = run('Get-ChildItem test -Name | Format-Table')
+  check(
+    'format-table passes data through',
+    formatted && formatted.stdout === plain.stdout,
+    JSON.stringify({ plain: plain?.stdout?.slice(0, 40), formatted: formatted?.stdout?.slice(0, 40) }),
+  )
+  const asText = run("Get-ChildItem test -Name | Out-String")
+  check('out-string joins', asText && asText.stdout === plain.stdout, JSON.stringify(asText?.stdout?.slice(0, 40)))
+}
+{
+  const missing = 'no-such-xyz-file'
+  const loud = run(`Remove-Item ${missing} -Force`)
+  check('remove missing errors by default', loud && loud.exitCode === 1, JSON.stringify(loud))
+  const quiet = run(`Remove-Item ${missing} -Force -ErrorAction SilentlyContinue`)
+  check('erroraction silences a missing file', quiet && quiet.exitCode === 0, JSON.stringify(quiet))
+  const alias = run(`Get-Item ${missing} -EA SilentlyContinue`)
+  check('erroraction -EA alias', alias && alias.exitCode === 0 && alias.stdout === '', JSON.stringify(alias))
+  const refusal = run('Remove-Item . -Recurse -Force -ErrorAction SilentlyContinue')
+  check(
+    'erroraction never silences a guard refusal',
+    refusal && refusal.exitCode === 1 && /拒绝删除/.test(refusal.stderr),
+    JSON.stringify(refusal),
+  )
 }
 
 console.log('PASS:\n  ' + ok.join('\n  '))

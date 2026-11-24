@@ -1,5 +1,28 @@
 # 更新记录
 
+## v1.9.0
+
+- 路径参数现在和 `valueOf` 一样展开 `$HOME` / `$env:X` / `$PWD`；仍无法精确展开的
+  `$` 引用（如 `"$HOME\Documents"`）回退真实 PowerShell，不再把 `$HOME` 当目录名。
+- `$HOME` 拿不到值时显式回退（此前静默成空串，路径可能落到当前目录）。
+- `Remove-Item` 增加静态路径护栏：盘符/共享根、系统与用户根、DSH 目录、cwd 及其祖先
+  直接拒绝（子目录照常可删）；`-WhatIf` 只预览、`-Confirm` 拒绝；缺 `-Path` 或空路径
+  不再把 cwd 当目标。
+- 删除目标必须静态可解析：含变量插值、通配符、空/未定义变量的删除直接拒绝而**不回退**
+  真实引擎（回退等于绕开护栏）；精确引用照常展开并过关。`File.Delete` 与
+  `Directory.Delete`（改为原生实现）走同一解析与护栏。
+- 结果 `warnings` 增加删除类提醒：递归/强制删除时提示，走原有 warnings 管道。
+- watch 在 `mtime` + 字节数未变时复用命令前哈希，不再整读第二遍（保住 mtime 的写入
+  会判为未变化，属纯性能取舍）。
+- 单对象管道送入 `Select-Object` / `Where-Object` / `ForEach-Object` / `Sort-Object` /
+  `Measure-Object` 不再报 `values.map is not a function`。
+- 面向模型/ token 收紧：拒绝信息统一 `fastsh:` 前缀、一句"原因 + 下一步"；工具 schema
+  与系统提示去重压缩，每轮固定开销约 2380 → 1360 tokens。
+- 原生化一批"要拼语句"的能力（少写输入、不落回真引擎）：`Get-FileHash`（SHA256/SHA1/MD5，
+  可接管道）、`ConvertFrom-Json`、`Resolve-Path`、`Select-Object -Unique`、
+  `Format-Table/List/Wide` 与 `Out-String` 透传、`-ErrorAction SilentlyContinue/Ignore`
+  （`-EA` 别名；真实错误可抑制，护栏拒绝不可抑制）。
+
 ## v1.8.8
 
 - `conclude_turn` 默认改为 `false`：后台任务启动后回合继续，模型必须先说明在跑什么、完成后再汇报；只有显式 `conclude_turn: true` 才立即结束回合。旧的默认值会让回合以"只有一个 job id"结束，表现为不回应。

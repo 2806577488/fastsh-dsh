@@ -28,7 +28,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 
 const UNSUPPORTED = Symbol('fastsh.ps.unsupported')
@@ -776,6 +776,58 @@ function runCmdlet(stage, input, context) {
       const compact = truthy(params.get('compress'))
       return JSON.stringify(value, null, compact ? 0 : 2)
     }
+    case 'convertfrom-json': {
+      const raw =
+        input !== undefined
+          ? pipelineValues(input)
+              .map((value) => (typeof value === 'string' ? value : renderValue(value)))
+              .join('\n')
+          : String(valueOf(param(params, 'inputobject') ?? args[0] ?? '', context))
+      if (!raw.trim()) return ''
+      try {
+        return JSON.parse(raw)
+      } catch (error) {
+        throw new Error(`fastsh: JSON 解析失败：${String(error?.message ?? error).slice(0, 80)}`)
+      }
+    }
+    case 'get-filehash': {
+      const algorithm = String(valueOf(param(params, 'algorithm') ?? 'SHA256', context))
+        .toUpperCase()
+        .replace(/[-_]/g, '')
+      const codec = { SHA256: 'sha256', SHA1: 'sha1', MD5: 'md5' }[algorithm]
+      if (!codec) nope(`Get-FileHash algorithm ${algorithm}`)
+      const targets = []
+      if (input !== undefined) {
+        for (const item of pipelineValues(input)) {
+          targets.push(typeof item === 'string' ? item : String(item?.FullName ?? item?.Path ?? item))
+        }
+      }
+      const single = param(params, 'path') ?? args[0]
+      if (single !== undefined) targets.push(String(valueOf(single, context)))
+      if (targets.length === 0) nope('Get-FileHash without -Path')
+      const hashes = targets.map((target) => {
+        const resolved = toPath(target, context)
+        if (!statSync(resolved).isFile()) throw new Error(`fastsh: 不是文件 ${resolved}`)
+        const hash = createHash(codec).update(readFileSync(resolved)).digest('hex').toUpperCase()
+        return { Algorithm: algorithm, Hash: hash, Path: resolved }
+      })
+      return hashes.length === 1 ? hashes[0] : hashes
+    }
+    case 'resolve-path': {
+      const target = toPath(param(params, 'path') ?? args[0], context)
+      if (!existsSync(target)) throw new Error(`fastsh: 路径不存在 ${target}`)
+      return target
+    }
+    case 'format-table':
+    case 'format-list':
+    case 'format-wide':
+      // Formatting is the renderer's job; keep the data instead of booting
+      // PowerShell just to draw a table.
+      return input ?? ''
+    case 'out-string':
+      return pipelineValues(input)
+        .map((value) => renderValue(value))
+        .join('\n')
     case 'write-output':
     case 'write-host':
     case 'echo':
@@ -783,6 +835,15 @@ function runCmdlet(stage, input, context) {
     case 'select-object':
     case 'select': {
       let values = pipelineValues(input)
+      if (truthy(params.get('unique'))) {
+        const seen = new Set()
+        values = values.filter((value) => {
+          const key = typeof value === 'string' ? value : JSON.stringify(value)
+          if (seen.has(key)) return false
+          seen.add(key)
+          return true
+        })
+      }
       const skip = param(params, 'skip')
       if (skip !== undefined) values = values.slice(Number(valueOf(skip, context)))
       const first = param(params, 'first')
@@ -1335,6 +1396,16 @@ function splitRedirect(statement) {
   }
 }
 
+/** `-ErrorAction` value of a parsed stage, including the `-EA` alias. */
+function errorActionOf(stage) {
+  for (const [key, value] of stage.params) {
+    if (key === 'erroraction' || key === 'ea') return typeof value === 'string' ? value.toLowerCase() : ''
+    if (key.startsWith('erroraction:')) return key.slice('erroraction:'.length)
+    if (key.startsWith('ea:')) return key.slice(3)
+  }
+  return ''
+}
+
 function runPipeline(command, context) {
   const single = command.trim()
   if (single.startsWith('[')) return callDotNet(single, context)
@@ -1361,7 +1432,18 @@ function runPipeline(command, context) {
     }
     for (; index < stages.length; index++) {
       const parsed = parseStage(stages[index])
-      values = runCmdlet(parsed, values, context)
+      try {
+        values = runCmdlet(parsed, values, context)
+      } catch (error) {
+        // -ErrorAction hides real errors, never a safety refusal.
+        if (error && (error[UNSUPPORTED] || error[REFUSED])) throw error
+        const action = errorActionOf(parsed)
+        if (action === 'silentlycontinue' || action === 'ignore') {
+          values = []
+          continue
+        }
+        throw error
+      }
       if (values === undefined) nope('undefined result')
     }
     return values
@@ -1438,7 +1520,9 @@ const COMMAND_HEADS = new Set([
   'new-item', 'ni', 'remove-item', 'rm', 'del', 'erase', 'copy-item', 'cp',
   'copy', 'move-item', 'mv', 'move', 'join-path', 'split-path', 'get-location',
   'pwd', 'get-date', 'date', 'get-process', 'gps', 'ps', 'select-string',
-  'sls', 'out-file', 'convertto-json', 'write-output', 'write-host', 'echo',
+  'sls', 'out-file', 'convertto-json', 'convertfrom-json', 'get-filehash',
+  'resolve-path', 'format-table', 'format-list', 'format-wide', 'out-string',
+  'ft', 'fl', 'write-output', 'write-host', 'echo',
   'select-object', 'select', 'where-object', 'where', 'foreach-object',
   'foreach', 'sort-object', 'sort', 'measure-object', 'measure',
 ])

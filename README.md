@@ -61,7 +61,10 @@ watch  out.png
 - 有变化时只显示新的哈希，不加「未变化」；
 - 文件被删掉显示 `gone`；本来就不存在显示 `missing`；
 - 读不到（权限、目录）显示 `error: …`，**采样失败绝不会让命令失败**；
-- 文本行只给哈希前 8 位，完整的 64 位值在 `watchReport` 里。
+- 文本行只给哈希前 8 位，完整的 64 位值在 `watchReport` 里；
+- 命令结束后若 `mtime` 与字节数都没变，直接复用命令前的哈希，不再把文件整读一遍。
+  代价是「保住 mtime 且大小不变」的写入会被判为未变化——这是纯性能取舍，不参与
+  安全判断。
 
 后台任务在 `run(job)` 启动前采样，命令结束、job 结算前把报告 `job.append` 到输出
 里；没有 jobs 服务、回退分离进程时，报告在进程 `close` 后追加进 stdout 日志。
@@ -76,9 +79,9 @@ watch  out.png
 ## 使用建议
 
 - 日常命令（`dir`、`type`、`copy`、`git`、`node`、`python`、管道与重定向）用 fastsh。
-- PowerShell cmdlet（`Get-ChildItem`、`$env:NAME`、.NET 类型）继续用 `pwsh`，
-  或者传 `shell: "powershell"`（它会用 `-EncodedCommand` 避免引号转义问题，
-  并强制 UTF-8 输出，但启动仍要 ~2 秒）。
+- PowerShell 语法（`Get-ChildItem`、`$env:NAME`、`[System.IO.File]::`、管道）也直接交给
+  fastsh：常用子集毫秒级原生执行，子集之外自动回退真引擎（~2 s）；`shell: "powershell"`
+  可以强制走真引擎（`-EncodedCommand`，UTF-8 输出）。
 - 长任务用 `run_in_background: true`：它成为 DSH 原生 job，`job_list` 能看到，
   `job_output` 可以流式读，`job_kill` 能停，会话结束时随所属 Agent 一起回收。
 
@@ -184,12 +187,13 @@ permission (@deepseek-ai/dsh-permission-presets): pending (waiting for service: 
 
 | 类别 | 支持 |
 |---|---|
-| 文件 | `Get-ChildItem`（`-Name/-File/-Directory/-Recurse/-Filter`）、`Get-Item`、`Get-Content`（`-Raw/-TotalCount/-Tail`）、`Set-Content`、`Add-Content`、`New-Item`、`Remove-Item`、`Copy-Item`、`Move-Item`、`Test-Path`、`Join-Path`、`Split-Path`、`Get-Location` |
-| 管道 | `Select-Object`（`-First/-Last/-Skip/-Property/-ExpandProperty`）、`Where-Object`（属性比较）、`ForEach-Object`（属性取值）、`Sort-Object`、`Measure-Object` |
+| 文件 | `Get-ChildItem`（`-Name/-File/-Directory/-Recurse/-Filter/-Depth`）、`Get-Item`、`Get-Content`（`-Raw/-TotalCount/-Tail`）、`Set-Content`、`Add-Content`、`New-Item`、`Remove-Item`、`Copy-Item`、`Move-Item`、`Test-Path`、`Join-Path`、`Split-Path`、`Get-Location`、`Resolve-Path`、`Get-FileHash`（`-Algorithm SHA256/SHA1/MD5`，可接管道） |
+| 管道 | `Select-Object`（`-First/-Last/-Skip/-Property/-ExpandProperty/-Unique`）、`Where-Object`（属性比较）、`ForEach-Object`（属性取值）、`Sort-Object`、`Measure-Object` |
 | 进程与时间 | `Get-Process`（`-Name/-Id`，走 tasklist，约 0.3 s）、`Get-Date`（`-Format` 支持 .NET 格式串） |
-| 文本与序列化 | `Select-String`（`-Path/-Pattern/-SimpleMatch/-CaseSensitive/-NotMatch`，输出 `路径:行号:内容`）、`Out-File`（`-Encoding/-Append`）、`Tee-Object`（`-FilePath/-Append`，透传）、`ConvertTo-Json`（`-Compress`） |
-| .NET 静态调用 | `[System.IO.File]::`（Exists/ReadAllText/ReadAllLines/WriteAllText/AppendAllText/Delete/Copy/Move）、`[System.IO.Directory]::`、`[System.IO.Path]::`、`[Environment]::`、`[math]::`、`[Guid]::NewGuid`、`[DateTime]::Now/UtcNow/Today/Parse` |
-| 变量 | 赋值 `$x = ...`、引用 `$x`、属性链 `$x.Name`、`$env:NAME`、`$PWD`、`$HOME`、`$null`、`$true/$false`、`$_` |
+| 文本与序列化 | `Select-String`（`-Path/-Pattern/-SimpleMatch/-CaseSensitive/-NotMatch`，输出 `路径:行号:内容`）、`Out-File`（`-Encoding/-Append`）、`Tee-Object`（`-FilePath/-Append`，透传）、`ConvertTo-Json`（`-Compress`）、`ConvertFrom-Json`（接字符串或 `Get-Content` 行）、`Format-Table/List/Wide` 与 `Out-String`（透传，由渲染器排版） |
+| 错误处理 | `-ErrorAction SilentlyContinue/Ignore`（`-EA` 别名）抑制真实的文件系统错误；**护栏拒绝永不被抑制** |
+| .NET 静态调用 | `[System.IO.File]::`（Exists/ReadAllText/ReadAllLines/WriteAllText/AppendAllText/Delete/Copy/Move）、`[System.IO.Directory]::`（含 Delete）、`[System.IO.Path]::`、`[Environment]::`、`[math]::`、`[Guid]::NewGuid`、`[DateTime]::Now/UtcNow/Today/Parse` |
+| 变量 | 赋值 `$x = ...`、引用 `$x`、属性链 `$x.Name`、`$env:NAME`、`$PWD`、`$HOME`、`$null`、`$true/$false`、`$_`；**路径参数同样展开**（`Test-Path $HOME`、`Get-Item $env:USERPROFILE`） |
 | 控制流 | `if / elseif / else`、`foreach ($x in ...)`、`try / catch / finally`、`;` 与换行语句分隔、`$(...)` 子表达式、反引号续行 |
 | 语法 | 重定向 `>`/`>>`/`2>`/`2>>`、调用运算符 `& exe args`（直接起进程，不套 shell） |
 | 参数 | `Get-ChildItem -Depth N`（BFS，目录优先再按名称，与 PowerShell 一致）、`Test-Path -PathType Leaf|Container` |
@@ -199,7 +203,28 @@ permission (@deepseek-ai/dsh-permission-presets): pending (waiting for service: 
 
 - 未知 cmdlet（如 `Get-ADUser`）或未知 .NET 类型；
 - `@{...}` 哈希表、`@(...)` 数组表达式；
+- 路径参数里还留有无法精确展开的 `$` 引用，例如 `"$HOME\Documents"`、`$env:X\f`——字符串内的变量插值只有真实引擎做；读命令回退真实引擎，删除命令直接拒绝（见上文护栏），都不会把 `$HOME` 当目录名；
+- `$HOME` 在环境里拿不到值（`USERPROFILE`/`HOME` 都为空）时回退，而不是静默拼出空路径；
 - `<` —— 注意 **PowerShell 本身也不支持**它（实测报“`<` 运算符是为将来使用而保留的”），所以这不是缺口。
+
+### 少写几条语句（原生糖）
+
+这些任务以前要拼一串 PS 语句、或者落回真引擎（~1.8 s），现在都是一条原生命令：
+
+| 任务 | 以前 | 现在 |
+|---|---|---|
+| 校验一个文件 | `(Get-FileHash app.exe).Hash`（回退） | `Get-FileHash app.exe` |
+| 目录里每个文件哈希 | `Get-ChildItem dist -File \| ForEach-Object { (Get-FileHash $_).Hash }` | `Get-ChildItem dist -File \| Get-FileHash` |
+| 读 JSON 字段 | `$j = Get-Content c.json \| ConvertFrom-Json; $j.version`（回退） | `Get-Content c.json \| ConvertFrom-Json \| Select-Object -ExpandProperty version` |
+| 去重 | `Get-Content l.txt \| Sort-Object -Unique`（回退） | `Get-Content l.txt \| Select-Object -Unique` |
+| 复制粘贴的格式化尾巴 | `... \| Format-Table`（回退） | `... \| Format-Table`（透传，由渲染器排版） |
+| 缺文件不报错 | `if (Test-Path x) { Remove-Item x }` | `Remove-Item x -ErrorAction SilentlyContinue` |
+
+通配符仍由管道负责：`Get-FileHash *.zip` 不展开，写 `Get-ChildItem *.zip | Get-FileHash`。
+
+`-ErrorAction SilentlyContinue/Ignore`（`-EA` 别名）只抑制真实的文件系统错误，
+删除护栏的拒绝不会被它吞掉——`Remove-Item . -Recurse -Force -EA SilentlyContinue`
+仍然失败并给出拒绝原因。
 
 ### 两处有意为之的编码差异
 
@@ -258,6 +283,38 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 嵌套引号在 cmd / PowerShell 里本来就容易被吞坏，脚本式替换应该走 `write`/`edit`
 或 Python 脚本（失败就 `sys.exit(1)`），别用 shell 拼字符串。
 
+## 删除类警告与 Remove-Item 护栏
+
+删除是唯一会让"一次错误的命令"变成不可逆损失的地方，所以分两层：
+
+**提示（不改行为）**：命令以 `Remove-Item` / `rm` / `del` / `erase` / `rd` / `rmdir`
+开头，且带 `-Recurse` / `/s` 或 `-Force` / `/f` / `/q` 时，结果最前面多一行
+`⚠ 删除类命令（递归或强制删除）…`，同时写进 `warnings`。普通 `del a.txt` 不提示。
+
+**护栏（拒绝执行）**：原生 `Remove-Item` 在删除前对解析后的绝对路径做一次静态判断，
+以下目标直接失败（`exitCode: 1`，不删除、不回退）：
+
+- 盘符根（`C:\`）与 UNC 共享根（`\\server\share`）；
+- `%SystemDrive%`、`%SystemRoot%`、`%SystemRoot%\System32`、`SysWOW64`、`Program Files`、
+  `Program Files (x86)`、`ProgramData`；
+- `USERPROFILE` 本身；
+- `DSH_HOME`、`DSH_PROFILE_DIR`、`DSH_INSTALL_DIR`；
+- 当前工作目录（`workdir`）本身，以及它的祖先（`..`）。
+
+这些根目录下的**普通子目录照常可删**（`Remove-Item build -Recurse -Force` 不受影响）。
+
+**删除目标必须静态可解析**：含变量插值（`"$HOME\Downloads"`）、通配符（`build\*`）、
+空/未定义变量的删除**直接拒绝，不回退真实引擎**——回退等于绕开护栏，而变量一旦
+悄悄解析到别处，就是删错目标的经典来源。精确引用（`$HOME`、`$env:TEMP\foo`、
+`$x`（已赋值）、`$f.FullName`）照常展开并过关；`-LiteralPath` 本就不做通配符展开，
+所以那里出现 `*` 时按普通文件名字符处理。`-Confirm` 也拒绝（这里没有交互控制台），
+`-WhatIf` 交回真引擎只打印；`[System.IO.File]::Delete` 与
+`[System.IO.Directory]::Delete` 走同一解析与护栏（`Directory.Delete` 在文件上仍按
+.NET 语义报错，不会删文件）。
+
+护栏覆盖原生引擎的删除。cmd 的 `del` / `rd /s` 不经过它；管道输入
+（`Get-ChildItem … | Remove-Item`）交回真引擎，此时护栏不适用。
+
 ## 执行隔离
 
 原生引擎跑在独立的 **worker 线程**里，不在宿主线程上执行：
@@ -278,16 +335,29 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 
 ## 已验证
 
-在 `test/ps.test.mjs`（46 项）、`test/exec.test.mjs`（59 项）、
-`test/plugin.test.mjs`（24 项）、`test/jobs.test.mjs`（17 项）与
+在 `test/ps.test.mjs`（91 项）、`test/exec.test.mjs`（67 项）、
+`test/plugin.test.mjs`（25 项）、`test/jobs.test.mjs`（17 项）与
 `test/perf.test.mjs`（9 项）中覆盖并通过：
 原生 PowerShell 子集（列目录、管道、Where/ForEach、.NET 静态调用、`$env:`、
-Test-Path）与"不支持必须回退"的边界，中文 GBK 解码、退出码透传、stderr 分离、
+Test-Path）与"不支持必须回退"的边界，路径参数里的变量展开（`$HOME`、`$env:X`、
+`$PWD`）与"必须回退"的插值边界，`Remove-Item` 护栏与 `-WhatIf`/空路径语义，
+`Get-FileHash`/`ConvertFrom-Json`/`Resolve-Path`/`Select-Object -Unique`/`Format-Table`
+透传与 `-ErrorAction`（含"护栏拒绝不可抑制"），
+中文 GBK 解码、退出码透传、stderr 分离、
 cwd 生效、引号与 `&` 保真、PowerShell 模式、超时杀树、abort、后台日志、
 BOM/GBK 解码、跨块多字节字符、jobs 的完成/失败/取消、`outputLimitBytes`、
 `conclude_turn`、`pwsh` 的 restrict/guard、PowerShell 语法自动识别、
-`watch` 的前台/后台/分离三种报告、文本替换警告、开头 `&` 剥离与
-`python -c`/`node -e` 判别、长输出裁剪保留错误行。
+`watch` 的前台/后台/分离三种报告与 mtime 短路、删除类警告、文本替换警告、
+开头 `&` 剥离与 `python -c`/`node -e` 判别、长输出裁剪保留错误行。
+
+## 给模型与 token 的取舍
+
+- 拒绝/提示信息统一 `fastsh:` 前缀，一句话给"为什么 + 下一步"（如
+  `fastsh: 拒绝删除受保护路径 C:\Windows（请改删其下的具体子目录）`），不重复路径。
+- 工具 schema 与系统提示按"每条规则只出现一次"压缩：每轮固定开销约
+  2380 → 1430 tokens（工具描述 346→293、参数 883→445、输出 schema 561→299、
+  提示段 590→395），能力清单与行为规则不删，只去重与收紧措辞。
+- 删除类提醒只在递归/强制删除时出现，普通 `del a.txt` 不占 token。
 
 ## 已知边界
 
