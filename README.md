@@ -189,7 +189,7 @@ permission (@deepseek-ai/dsh-permission-presets): pending (waiting for service: 
 |---|---|
 | 文件 | `Get-ChildItem`（`-Name/-File/-Directory/-Recurse/-Filter/-Depth`）、`Get-Item`、`Get-Content`（`-Raw/-TotalCount/-Tail`）、`Set-Content`、`Add-Content`、`New-Item`、`Remove-Item`、`Copy-Item`、`Move-Item`、`Test-Path`、`Join-Path`、`Split-Path`、`Get-Location`、`Resolve-Path`、`Get-FileHash`（`-Algorithm SHA256/SHA1/MD5`，可接管道） |
 | 管道 | `Select-Object`（`-First/-Last/-Skip/-Property/-ExpandProperty/-Unique`）、`Where-Object`（属性比较）、`ForEach-Object`（属性取值）、`Sort-Object`、`Measure-Object` |
-| 进程与时间 | `Get-Process`（`-Name/-Id`，走 tasklist，约 0.3 s）、`Get-Date`（`-Format` 支持 .NET 格式串） |
+| 进程与时间 | `Get-Process`（`-Name/-Id`，走 tasklist，约 0.3 s）、`Get-Date`（`-Format` 支持 .NET 格式串）、`Start-Sleep`（`-Seconds`/`-Milliseconds`，含 `sleep` 别名；原生等待，>30 s 回退真引擎） |
 | 文本与序列化 | `Select-String`（`-Path/-Pattern/-SimpleMatch/-CaseSensitive/-NotMatch`，输出 `路径:行号:内容`）、`Out-File`（`-Encoding/-Append`）、`Tee-Object`（`-FilePath/-Append`，透传）、`ConvertTo-Json`（`-Compress`）、`ConvertFrom-Json`（接字符串或 `Get-Content` 行）、`Format-Table/List/Wide` 与 `Out-String`（透传，由渲染器排版） |
 | 错误处理 | `-ErrorAction SilentlyContinue/Ignore`（`-EA` 别名）抑制真实的文件系统错误；**护栏拒绝永不被抑制** |
 | .NET 静态调用 | `[System.IO.File]::`（Exists/ReadAllText/ReadAllLines/WriteAllText/AppendAllText/Delete/Copy/Move）、`[System.IO.Directory]::`（含 Delete）、`[System.IO.Path]::`、`[Environment]::`、`[math]::`、`[Guid]::NewGuid`、`[DateTime]::Now/UtcNow/Today/Parse` |
@@ -219,6 +219,7 @@ permission (@deepseek-ai/dsh-permission-presets): pending (waiting for service: 
 | 去重 | `Get-Content l.txt \| Sort-Object -Unique`（回退） | `Get-Content l.txt \| Select-Object -Unique` |
 | 复制粘贴的格式化尾巴 | `... \| Format-Table`（回退） | `... \| Format-Table`（透传，由渲染器排版） |
 | 缺文件不报错 | `if (Test-Path x) { Remove-Item x }` | `Remove-Item x -ErrorAction SilentlyContinue` |
+| 等待 1 秒 | `powershell -NoProfile … "Start-Sleep -Seconds 1"`（实测 ~2.9 s） | `Start-Sleep -Seconds 1`（原生，~1 s；设备等待用 `adb shell sleep 1`） |
 
 通配符仍由管道负责：`Get-FileHash *.zip` 不展开，写 `Get-ChildItem *.zip | Get-FileHash`。
 
@@ -348,7 +349,7 @@ cmd 跑不了 PowerShell cmdlet、`$env:`、`[System.]`、`::` 静态调用这�
 
 ## 已验证
 
-在 `test/ps.test.mjs`（91 项）、`test/exec.test.mjs`（74 项）、
+在 `test/ps.test.mjs`（96 项）、`test/exec.test.mjs`（75 项）、
 `test/plugin.test.mjs`（25 项）、`test/jobs.test.mjs`（17 项）与
 `test/perf.test.mjs`（9 项）中覆盖并通过：
 原生 PowerShell 子集（列目录、管道、Where/ForEach、.NET 静态调用、`$env:`、
@@ -356,7 +357,7 @@ Test-Path）与"不支持必须回退"的边界，路径参数里的变量展开
 `$PWD`）与"必须回退"的插值边界，`Remove-Item` 护栏与 `-WhatIf`/空路径语义，
 `Get-FileHash`/`ConvertFrom-Json`/`Resolve-Path`/`Select-Object -Unique`/`Format-Table`
 透传与 `-ErrorAction`（含"护栏拒绝不可抑制"），PATH 覆盖提醒（整体赋值/`setx`/
-`$env:PATH`，追加不提示），
+`$env:PATH`，追加不提示），原生 `Start-Sleep`（毫秒/小数秒/别名/超长回退），
 中文 GBK 解码、退出码透传、stderr 分离、
 cwd 生效、引号与 `&` 保真、PowerShell 模式、超时杀树、abort、后台日志、
 BOM/GBK 解码、跨块多字节字符、jobs 的完成/失败/取消、`outputLimitBytes`、
@@ -369,8 +370,8 @@ BOM/GBK 解码、跨块多字节字符、jobs 的完成/失败/取消、`outputL
 - 拒绝/提示信息统一 `fastsh:` 前缀，一句话给"为什么 + 下一步"（如
   `fastsh: 拒绝删除受保护路径 C:\Windows（请改删其下的具体子目录）`），不重复路径。
 - 工具 schema 与系统提示按"每条规则只出现一次"压缩：每轮固定开销约
-  2380 → 1450 tokens（工具描述 346→293、参数 883→445、输出 schema 561→299、
-  提示段 590→415），能力清单与行为规则不删，只去重与收紧措辞。
+  2380 → 1465 tokens（工具描述 346→293、参数 883→445、输出 schema 561→299、
+  提示段 590→445），能力清单与行为规则不删，只去重与收紧措辞。
 - 删除类提醒只在递归/强制删除时出现，普通 `del a.txt` 不占 token；PATH 提醒只在
   未追加 `%PATH%`/`$env:PATH` 的整体赋值时出现。
 

@@ -486,6 +486,22 @@ const check = (name, cond, detail) => (cond ? ok : bad).push(`${name} ${detail ?
   rmSync(target, { force: true })
 }
 
+// Start-Sleep 原生：等待本身，不再启动 PowerShell（实测 2.9 s → ~1 s）
+{
+  const started = Date.now()
+  const r = run('Start-Sleep -Milliseconds 60')
+  const elapsed = Date.now() - started
+  check('start-sleep milliseconds', r && r.exitCode === 0 && elapsed >= 55 && elapsed < 2000, `${elapsed}ms`)
+  const seconds = run('Start-Sleep -Seconds 0.05')
+  check('start-sleep fractional seconds', seconds && seconds.exitCode === 0, JSON.stringify(seconds))
+  const alias = run('sleep -Milliseconds 10')
+  check('start-sleep alias', alias && alias.exitCode === 0, JSON.stringify(alias))
+  const long = run('Start-Sleep -Seconds 120')
+  check('start-sleep long declines', long === null, JSON.stringify(long))
+  const invalid = run('Start-Sleep -Seconds nope')
+  check('start-sleep invalid declines', invalid === null, JSON.stringify(invalid))
+}
+
 // sugar: cmdlets that used to need a pile of statements (or a real PowerShell boot)
 {
   const expected = createHash('sha256').update(readFileSync('package.json')).digest('hex').toUpperCase()

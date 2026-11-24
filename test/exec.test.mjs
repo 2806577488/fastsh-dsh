@@ -464,6 +464,14 @@ function check(name, ok, detail) {
   )
 }
 
+// 23. Start-Sleep 原生端到端：不再启动 PowerShell
+{
+  const started = Date.now()
+  const r = await runCommand({ command: 'Start-Sleep -Milliseconds 50', cwd: process.cwd() })
+  const elapsed = Date.now() - started
+  check('start-sleep native end-to-end', r.exitCode === 0 && elapsed < 1500, `${elapsed}ms`)
+}
+
 const failed = results.filter((r) => !r.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 process.exit(failed.length ? 1 : 0)

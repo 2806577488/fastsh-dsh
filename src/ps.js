@@ -545,6 +545,18 @@ function runScriptBlock(block, item, context) {
   nope(`script block: ${inner}`)
 }
 
+/** Longest wait the native worker accepts; longer sleeps go to the real engine. */
+const MAX_NATIVE_SLEEP_MS = 30_000
+
+/**
+ * Sleep without burning CPU. Blocks this worker thread only, so the host and
+ * the child-process path stay responsive.
+ */
+function sleepBlocking(ms) {
+  if (!(ms > 0)) return
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
 function runCmdlet(stage, input, context) {
   const { name, params, positional } = stage
   const args = [...positional]
@@ -828,6 +840,20 @@ function runCmdlet(stage, input, context) {
       return pipelineValues(input)
         .map((value) => renderValue(value))
         .join('\n')
+    case 'start-sleep':
+    case 'sleep': {
+      const milliseconds = param(params, 'milliseconds')
+      const seconds = param(params, 'seconds')
+      let ms
+      if (milliseconds !== undefined) ms = Number(valueOf(milliseconds, context))
+      else if (seconds !== undefined) ms = Number(valueOf(seconds, context)) * 1000
+      if (ms === undefined || !Number.isFinite(ms) || ms < 0) nope('Start-Sleep without a duration')
+      // One serialized worker: a long sleep would stall every later native call,
+      // so the real engine owns waits above the cap.
+      if (ms > MAX_NATIVE_SLEEP_MS) nope('Start-Sleep longer than the native cap')
+      sleepBlocking(ms)
+      return ''
+    }
     case 'write-output':
     case 'write-host':
     case 'echo':
@@ -1522,7 +1548,7 @@ const COMMAND_HEADS = new Set([
   'pwd', 'get-date', 'date', 'get-process', 'gps', 'ps', 'select-string',
   'sls', 'out-file', 'convertto-json', 'convertfrom-json', 'get-filehash',
   'resolve-path', 'format-table', 'format-list', 'format-wide', 'out-string',
-  'ft', 'fl', 'write-output', 'write-host', 'echo',
+  'start-sleep', 'sleep', 'ft', 'fl', 'write-output', 'write-host', 'echo',
   'select-object', 'select', 'where-object', 'where', 'foreach-object',
   'foreach', 'sort-object', 'sort', 'measure-object', 'measure',
 ])

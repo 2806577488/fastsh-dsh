@@ -1,5 +1,14 @@
 # 更新记录
 
+## v1.9.2
+
+- `Start-Sleep`（含 `sleep` 别名）原生实现：等待本身，不再启动 PowerShell
+  （实测 `powershell Start-Sleep 1` 约 2.9 s，原生约 1 s；支持 `-Milliseconds` 与小数值
+  `-Seconds`；超过 30 s 回退真实引擎，避免长时间占用串行 worker）。
+- 提示词：等待优先用目标自身 sleep（`adb shell sleep 1`）或原生 `Start-Sleep`，
+  只有 cmd 链式命令才需要 `powershell ... Start-Sleep`。
+- 测试：ps 91 → 96（Start-Sleep 5 项）、exec 74 → 75（原生端到端 1 项）。
+
 ## v1.9.1
 
 - 新增 PATH 覆盖提醒：`set "PATH=..."` / `setx PATH` / `$env:PATH = "..."` 未带上
