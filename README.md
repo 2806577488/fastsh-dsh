@@ -94,6 +94,35 @@ watch  out.png
 - 长任务用 `run_in_background: true`：它成为 DSH 原生 job，`job_list` 能看到，
   `job_output` 可以流式读，`job_kill` 能停，会话结束时随所属 Agent 一起回收。
 
+## 使用记录（usage log）
+
+每次执行都追加一行 JSON 到 `%LOCALAPPDATA%\dsh-fastsh\usage.jsonl`（5 MB 轮换成
+`.1`），用来回答“这条命令走了原生还是降级真引擎、为什么”。覆盖前台、后台 job、
+分离进程、被拒绝的调用（空命令 / 被拦下的 `pwsh`）。
+
+| 字段 | 含义 |
+|---|---|
+| `kind` | `run`（前台/分离）、`job`（DSH job 结束时）、`rejected`（空命令）、`denied`（pwsh 被拦） |
+| `engine` | `native`、`cmd`、`cmd-bat`、`powershell`、`powershell-file`、`delegate`、`error` |
+| `path` | `auto-native`、`auto-native-fallback`（降级）、`auto-cmd`、`explicit-powershell`、`explicit-cmd`、`job`、`detached` |
+| `fallbackFrom` / `fallbackReason` | 降级时为 `native`，以及原生子集拒绝的具体原因（如 `Get-Item returns provider objects`） |
+| `shell` | 调用方传的 `auto` / `cmd` / `powershell` |
+| `durationMs` / `exitCode` / `timedOut` / `aborted` | 结果 |
+| `command` / `commandChars` | 命令文本（最多 2 KB，`commandChars` 是真实长度） |
+| `stdoutChars` / `stderrChars` / `warnings` | 输出规模与提示条数 |
+| `agentId` / `callId` / `description` | 谁在什么描述下发的（来自 DSH 工具调用） |
+
+- 关闭：`FASTSH_USAGE_LOG=off`；改路径：`FASTSH_USAGE_LOG=D:\logs\fastsh.jsonl`。
+- 只在本机、只追加；命令文本可能含敏感内容（token 之类），分享前先看一眼。写日志
+  失败会被吞掉——可观测性不能变成执行失败。
+- 看降级都发生在哪：
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\dsh-fastsh\usage.jsonl" |
+  ConvertFrom-Json | Group-Object engine, path |
+  Sort-Object Count -Descending | Select-Object -First 10 Count, Name
+```
+
 ## 后台任务（jobs 集成）
 
 `run_in_background: true` 走 `ctx.jobs.start()`，规格是：

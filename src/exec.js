@@ -27,6 +27,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { Worker } from 'node:worker_threads'
+import { commandForLog, recordUsage } from './usage.js'
 
 export const DEFAULT_TIMEOUT_MS = 120_000
 export const MIN_TIMEOUT_MS = 1_000
@@ -510,6 +511,7 @@ function shellCommand(command, shell) {
         file: 'powershell.exe',
         args: [...PS_LAUNCH_ARGS, '-File', file],
         options: {},
+        engine: 'powershell-file',
         cleanup: () => removeTempScript(file),
       }
     }
@@ -517,6 +519,7 @@ function shellCommand(command, shell) {
       file: 'powershell.exe',
       args: [...PS_LAUNCH_ARGS, '-EncodedCommand', encoded],
       options: {},
+      engine: 'powershell',
     }
   }
   // cmd.exe stops at the first newline, and chaining with ` & ` changes what the
@@ -533,10 +536,11 @@ function shellCommand(command, shell) {
       file: 'cmd.exe',
       args: ['/d', '/s', '/c', file],
       options: {},
+      engine: 'cmd-bat',
       cleanup: () => removeTempScript(file),
     }
   }
-  return { file: script, args: [], options: { shell: true } }
+  return { file: script, args: [], options: { shell: true }, engine: 'cmd' }
 }
 
 /**
@@ -734,6 +738,8 @@ let nativeWorker = null
 let nativeSequence = 0
 const nativePending = new Map()
 let nativeChain = Promise.resolve()
+/** Why the last native attempt declined; recorded by the usage log. */
+let lastNativeUnsupported = null
 
 function failNativeWorker(error) {
   const pending = [...nativePending.values()]
@@ -749,6 +755,7 @@ function ensureNativeWorker() {
     const entry = nativePending.get(message.id)
     if (!entry) return
     nativePending.delete(message.id)
+    lastNativeUnsupported = message.result === null || message.result === undefined ? message.unsupported ?? null : null
     if (message.error) entry.reject(new Error(message.error))
     else entry.resolve(message.result)
   })
@@ -941,6 +948,8 @@ export function runCommand(request, signal) {
     ...detectDeleteRisk(request.command),
     ...detectPathOverwrite(request.command),
   ]
+  // Which engine actually served this call, for the usage log.
+  const route = { engine: null, path: 'auto', fallbackReason: null }
   const finalizeResult = (result) => {
     let out = result
     if (watchSnapshot) {
@@ -948,6 +957,24 @@ export function runCommand(request, signal) {
       if (report) out = { ...out, watchReport: report }
     }
     if (warnings.length) out = { ...out, warnings }
+    recordUsage({
+      kind: 'run',
+      ...commandForLog(request.command),
+      shell,
+      path: route.path,
+      engine: route.engine ?? (out.error ? 'error' : 'unknown'),
+      ...(route.fallbackReason ? { fallbackFrom: 'native', fallbackReason: route.fallbackReason } : {}),
+      durationMs: out.durationMs ?? null,
+      exitCode: out.exitCode ?? null,
+      timedOut: Boolean(out.timedOut),
+      aborted: Boolean(out.aborted),
+      truncated: Boolean(out.truncated),
+      stdoutChars: typeof out.stdout === 'string' ? out.stdout.length : 0,
+      stderrChars: typeof out.stderr === 'string' ? out.stderr.length : 0,
+      ...(warnings.length ? { warnings: warnings.length } : {}),
+      cwd,
+      ...(request.meta ?? {}),
+    })
     return out
   }
 
@@ -958,6 +985,7 @@ export function runCommand(request, signal) {
       // Native results never start a process, so they must not pay for a
       // temporary script file either.
       if (native && !native.delegate) {
+        route.engine = 'native'
         const out = shape(native.stdout ?? '', maxChars, 'utf-8')
         const err = shape(native.stderr ?? '', maxChars, 'utf-8')
         if (logFile) {
@@ -988,6 +1016,7 @@ export function runCommand(request, signal) {
       const launched = shellCommand(command, shell)
       let { file, args, options, error } = launched
       cleanup = launched.cleanup ?? null
+      route.engine = launched.engine ?? route.engine
 
       if (error) {
         resolve({
@@ -1026,6 +1055,7 @@ export function runCommand(request, signal) {
       file = native.delegate.file
       args = native.delegate.args
       options = {}
+      route.engine = 'delegate'
     }
 
     // Raw child bytes also go to the caller's log file, so a long run keeps a
@@ -1227,20 +1257,39 @@ export function runCommand(request, signal) {
     shell === 'powershell' ||
     !detectPowerShell(command)
   ) {
+    route.path = shell === 'cmd' ? 'explicit-cmd' : shell === 'powershell' ? 'explicit-powershell' : 'auto-cmd'
     return execute(null).then(finalizeResult)
   }
 
   // A native command runs in a worker, so a runaway regex or a huge listing
   // can be terminated instead of freezing the host process.
+  route.path = 'auto-native'
   return runNativeIsolated(command, cwd, Math.min(timeoutMs, NATIVE_TIMEOUT_MS), signal)
     .then((native) => {
-      if (!native) return execute(null)
-      if (native.aborted) return nativeAbortedResult(startedAt)
-      if (native.timedOut) return nativeTimedOutResult(startedAt)
-      if (native.error) return execute(null)
+      if (!native) {
+        route.path = 'auto-native-fallback'
+        route.fallbackReason = lastNativeUnsupported
+        return execute(null)
+      }
+      if (native.aborted) {
+        route.path = 'auto-native-aborted'
+        return nativeAbortedResult(startedAt)
+      }
+      if (native.timedOut) {
+        route.path = 'auto-native-timeout'
+        return nativeTimedOutResult(startedAt)
+      }
+      if (native.error) {
+        route.path = 'auto-native-fallback'
+        route.fallbackReason = native.error
+        return execute(null)
+      }
       return execute(native)
     })
-    .catch(() => execute(null))
+    .catch(() => {
+      route.path = 'auto-native-fallback'
+      return execute(null)
+    })
     .then(finalizeResult)
 }
 
@@ -1249,7 +1298,7 @@ export function runCommand(request, signal) {
  * The caller gets the pid and the paths, so the run survives this turn.
  */
 export function runInBackground(request) {
-  const { command, cwd, shell = 'auto', logFile, watch } = request
+  const { command, cwd, shell = 'auto', logFile, watch, meta } = request
   const launched = shellCommand(command, shell)
   const { file, args, options, error } = launched
   if (error) throw new Error(error)
@@ -1288,6 +1337,17 @@ export function runInBackground(request) {
     // A temporary .bat/.ps1 must survive until the detached child is done with
     // it, so it is removed on close rather than right after spawning.
     if (launched.cleanup) child.on('close', () => launched.cleanup())
+    recordUsage({
+      kind: 'run',
+      mode: 'detached',
+      ...commandForLog(command),
+      shell,
+      path: 'detached',
+      engine: launched.engine ?? 'unknown',
+      pid: child.pid,
+      cwd,
+      ...(meta ?? {}),
+    })
     return { pid: child.pid, stdoutPath, stderrPath, command }
   } finally {
     closeSync(out)
@@ -1419,7 +1479,7 @@ export function createStreamDecoder(forced = 'auto') {
  * @returns {string} the registry-issued job id
  */
 export function startBackgroundJob(request) {
-  const { jobs, command, cwd, shell = 'auto', encoding = 'auto', label, owner, toolCall, logFile, watch } = request
+  const { jobs, command, cwd, shell = 'auto', encoding = 'auto', label, owner, toolCall, logFile, watch, meta } = request
   const outputLimitBytes = clampOutputLimit(request.outputLimitBytes)
   const spec = {
     kind: 'bash',
@@ -1435,6 +1495,25 @@ export function startBackgroundJob(request) {
       const out = createStreamDecoder(encoding)
       const err = createStreamDecoder(encoding)
       const errClixml = createClixmlFilter()
+      const startedAt = Date.now()
+      let logged = false
+      const logJob = (status, exitCode = null) => {
+        if (logged) return
+        logged = true
+        recordUsage({
+          kind: 'job',
+          ...commandForLog(command),
+          shell,
+          path: 'job',
+          engine: launched.engine ?? 'unknown',
+          status,
+          jobId: job.id,
+          durationMs: Date.now() - startedAt,
+          exitCode,
+          cwd,
+          ...(meta ?? {}),
+        })
+      }
 
       // 启动前先抓一份产物指纹；命令结束、settle 之前再抓一份并写进 job 输出。
       let watchSnapshot = snapshotWatch(watch, cwd)
@@ -1504,6 +1583,7 @@ export function startBackgroundJob(request) {
         })
       } catch (error) {
         cleanup?.()
+        logJob('failed')
         settle('failed', error?.message ?? String(error))
         return { cancel() {}, done }
       }
@@ -1524,6 +1604,7 @@ export function startBackgroundJob(request) {
         appendWatch()
         closeLog()
         cleanup?.()
+        logJob('failed')
         settle('failed', error?.message ?? String(error))
       })
 
@@ -1539,9 +1620,16 @@ export function startBackgroundJob(request) {
         cleanup?.()
         // The registry merges the caller's kill reason into `detail`; do not
         // repeat it here.
-        if (killReason !== null) settle('killed')
-        else if (code === 0) settle('completed', 'exit code 0')
-        else settle('failed', `exit code ${code ?? 'unknown'}`)
+        if (killReason !== null) {
+          logJob('killed')
+          settle('killed')
+        } else if (code === 0) {
+          logJob('completed', 0)
+          settle('completed', 'exit code 0')
+        } else {
+          logJob('failed', code ?? null)
+          settle('failed', `exit code ${code ?? 'unknown'}`)
+        }
       }
 
       child.on('exit', (code) => {

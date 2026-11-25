@@ -11,6 +11,9 @@ import { join } from 'node:path'
 import { runNativePowerShell } from '../src/ps.js'
 import { runCommand, decodeOutput, detectPowerShell } from '../src/exec.js'
 
+// Perf guards must not pollute the user's usage log.
+process.env.FASTSH_USAGE_LOG = 'off'
+
 const root = join(import.meta.dirname, 'tmp-perf')
 const cwd = process.cwd()
 const context = { cwd, env: process.env }

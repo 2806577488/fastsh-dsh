@@ -7,6 +7,7 @@
 
 import { isAbsolute, resolve } from 'node:path'
 import { clampOutputLimit, formatWatchReport, runCommand, runInBackground, startBackgroundJob } from './src/exec.js'
+import { commandForLog, recordUsage } from './src/usage.js'
 
 export const name = 'fastsh'
 
@@ -206,6 +207,7 @@ function tryStartJob(ctx, request, input, exec) {
       outputLimitBytes: clampOutputLimit(input.outputLimitBytes),
       logFile: request.logFile,
       watch: request.watch,
+      meta: request.meta,
     })
   } catch {
     // The jobs service refuses work when no attached controller serves the owner.
@@ -244,6 +246,13 @@ function createDefinition(ctx) {
     async execute(args, exec) {
       const input = args && typeof args === 'object' ? args : {}
       if (typeof input.command !== 'string' || input.command.trim() === '') {
+        recordUsage({
+          kind: 'rejected',
+          reason: 'empty command',
+          agentId: exec?.agent?.id,
+          callId: exec?.callId,
+          description: typeof input.description === 'string' ? input.description : undefined,
+        })
         throw new Error('fastsh requires a non-empty "command" string.')
       }
 
@@ -273,6 +282,12 @@ function createDefinition(ctx) {
               .filter((entry) => typeof entry === 'string' && entry.trim() !== '')
               .map((entry) => entry.trim())
           : undefined,
+        // Carried into the usage log only: who asked, and for what.
+        meta: {
+          agentId: exec?.agent?.id,
+          callId: exec?.callId,
+          description: typeof input.description === 'string' ? input.description : undefined,
+        },
       }
 
       if (input.run_in_background === true) {
@@ -350,11 +365,16 @@ export function apply(ctx) {
   // Last line of defence: if a pwsh call still reaches execution, refuse it.
   try {
     ctx.effect(() =>
-      ctx.tools.guard((execution) =>
-        execution?.name === REPLACED_TOOL
-          ? `The ${REPLACED_TOOL} tool is disabled in this profile. Run the command with fastsh instead; for PowerShell syntax pass shell: "powershell".`
-          : undefined,
-      ),
+      ctx.tools.guard((execution) => {
+        if (execution?.name !== REPLACED_TOOL) return undefined
+        recordUsage({
+          kind: 'denied',
+          tool: REPLACED_TOOL,
+          ...commandForLog(execution?.args?.command),
+          agentId: execution?.agent?.id,
+        })
+        return `The ${REPLACED_TOOL} tool is disabled in this profile. Run the command with fastsh instead; for PowerShell syntax pass shell: "powershell".`
+      }),
     )
   } catch {
     /* the prompt rule still applies */

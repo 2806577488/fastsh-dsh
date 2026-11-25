@@ -9,6 +9,9 @@ import { fileURLToPath } from 'node:url'
 // Fixtures are addressed from the package root.
 process.chdir(fileURLToPath(new URL('..', import.meta.url)))
 
+// Tests must not pollute the user's usage log.
+process.env.FASTSH_USAGE_LOG = 'off'
+
 /** Sleep command that starts no PING.EXE. */
 const SLEEP = `"${process.execPath}" "${fileURLToPath(new URL('./sleep.cjs', import.meta.url))}"`
 

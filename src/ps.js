@@ -2244,14 +2244,21 @@ function formatDotNetDate(date, format) {
 }
 
 export function runNativePowerShell(command, context) {
+  /** Record why this command must go to the real engine, then decline it. */
+  const decline = (reason) => {
+    if (context) context.unsupported = reason
+    return null
+  }
+  if (context) context.unsupported = undefined
+
   const normalized = String(command).replace(/`\r?\n/g, ' ')
   const bare = stripQuoted(normalized)
   // `<` needs a live stdin pipe, which the native path does not own.
-  if (/</.test(bare)) return null
-  if (/@\{|@\(/.test(bare)) return null
+  if (/</.test(bare)) return decline('stdin redirection (<)')
+  if (/@\{|@\(/.test(bare)) return decline('hash table or array expression')
 
   const statements = splitStatements(normalized)
-  if (statements.length === 0) return null
+  if (statements.length === 0) return decline('empty script')
 
   // One execution = one variable scope.
   const scope = { ...context, vars: {}, loop: undefined }
@@ -2267,7 +2274,7 @@ export function runNativePowerShell(command, context) {
     }
     return { supported: true, stdout: outputs.filter((text) => text !== '').join('\n'), stderr: '', exitCode: 0 }
   } catch (error) {
-    if (error && error[UNSUPPORTED]) return null
+    if (error && error[UNSUPPORTED]) return decline(error.message ?? 'unsupported')
     // A real filesystem error is a real command failure, not a fallback.
     return {
       supported: true,

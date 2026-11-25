@@ -11,6 +11,9 @@ import { fileURLToPath } from 'node:url'
 // Fixtures are addressed from the package root.
 process.chdir(fileURLToPath(new URL('..', import.meta.url)))
 
+// Tests must not pollute the user's usage log.
+process.env.FASTSH_USAGE_LOG = 'off'
+
 function dropLink(path) {
   try {
     if (existsSync(path) && lstatSync(path).isSymbolicLink()) unlinkSync(path)

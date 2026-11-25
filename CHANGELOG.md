@@ -1,5 +1,19 @@
 # 更新记录
 
+## v1.9.8
+
+- 新增使用记录（usage log）：每次执行追加一行 JSON 到
+  `%LOCALAPPDATA%\dsh-fastsh\usage.jsonl`（5 MB 轮换），记录 `engine` / `path` /
+  耗时 / 退出码 / 输出规模 / 命令文本（≤2 KB）/ `agentId` / `callId` / `description`。
+  覆盖前台、后台 job、分离进程，以及被拒绝的调用（空命令、被拦下的 `pwsh`）。
+  `FASTSH_USAGE_LOG=off` 关闭，`FASTSH_USAGE_LOG=<路径>` 改位置；写日志失败被吞掉，
+  不影响命令本身。
+- 原生子集现在回报拒绝原因：`runNativePowerShell` 把原因写进 `context.unsupported`
+  （`<`、`@{}`、未知 cmdlet、注册表非标量键…），worker 回传给宿主，于是降级原因
+  能落进 `fallbackReason`——这份数据直接说明原生子集下一步该补什么。
+- 测试：新增 `test/usage.test.mjs`；6 套 288 项全绿。测试套件内 `FASTSH_USAGE_LOG=off`，
+  跑测试不会污染真实日志。
+
 ## v1.9.7
 
 - 修长脚本直接崩：`powershell.exe` 的命令行超过约 4 KB 就 fail-fast（exit `0xc0000409`、
