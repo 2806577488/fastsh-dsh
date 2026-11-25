@@ -1,12 +1,12 @@
 # 发布与收录
 
 仓库：<https://github.com/2806577488/fastsh-dsh>
-当前版本：`v1.9.8`
+当前版本：`v1.10.0`
 
 ## 安装
 
 ```
-dsh plugin add git+https://github.com/2806577488/fastsh-dsh.git#v1.9.8
+dsh plugin add git+https://github.com/2806577488/fastsh-dsh.git#v1.10.0
 ```
 
 `git+` 源要求用户机器上装有 git；没有 git 的用户暂时装不了，等有 npm 包再解决。
@@ -39,4 +39,4 @@ dsh plugin add git+https://github.com/2806577488/fastsh-dsh.git#v1.9.8
 | `src/exec.js` | 进程执行、编码解码、超时杀树、jobs 集成 |
 | `src/ps.js` | 原生 PowerShell 子集（含删除护栏与原生糖） |
 | `cordis.patch.yml` | bundle 补丁，插入一行 `fastsh` |
-| `test/` | 6 套回归，共 280+ 项 |
+| `test/` | 7 套回归，共 300+ 项 |

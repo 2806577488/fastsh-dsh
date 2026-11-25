@@ -94,6 +94,20 @@ watch  out.png
 - 长任务用 `run_in_background: true`：它成为 DSH 原生 job，`job_list` 能看到，
   `job_output` 可以流式读，`job_kill` 能停，会话结束时随所属 Agent 一起回收。
 
+## 可选的持久 PowerShell 宿主
+
+默认每次回退都新起一个 `powershell.exe`（约 1.5 s 启动）。设 `FASTSH_REUSE_ENGINE=1`
+后 fastsh 保留一个常驻宿主，每条命令在**全新作用域**里执行（`& { … }`），本机实测
+第二次回退从 ~2 s 降到 **7 ms**（首次仍要等宿主启动 ~2 s）。
+
+- 每次调用重置：变量/函数/别名（子作用域）、工作目录（每条命令前 `Set-Location`）、
+  环境变量（宿主启动时快照，命令结束后还原）。
+- 不隔离：已加载的模块/类型与进程级设置（`[Console]` 编码等）——这正是它快的原因。
+- 边界：脚本里 `exit N` 会结束宿主，fastsh 用宿主退出码 + 已写盘的输出报告结果，
+  下一次调用自动起新宿主；超时会杀掉宿主并返回 `timedOut`，下一条命令重新拉起。
+- 默认**关闭**（未设或 `0` 时仍走一次性进程），因为它改变了「每次都是干净进程」的语义。
+  usage log 里这类执行记为 `engine: "powershell-reused"`。
+
 ## 使用记录（usage log）
 
 每次执行都追加一行 JSON 到 `%LOCALAPPDATA%\dsh-fastsh\usage.jsonl`（5 MB 轮换成

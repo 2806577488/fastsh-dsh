@@ -28,6 +28,7 @@ import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { commandForLog, recordUsage } from './usage.js'
+import { reuseEngineEnabled, runReusedPowerShell } from './pwsh-host.js'
 
 export const DEFAULT_TIMEOUT_MS = 120_000
 export const MIN_TIMEOUT_MS = 1_000
@@ -512,6 +513,7 @@ function shellCommand(command, shell) {
         args: [...PS_LAUNCH_ARGS, '-File', file],
         options: {},
         engine: 'powershell-file',
+        psScript,
         cleanup: () => removeTempScript(file),
       }
     }
@@ -520,6 +522,7 @@ function shellCommand(command, shell) {
       args: [...PS_LAUNCH_ARGS, '-EncodedCommand', encoded],
       options: {},
       engine: 'powershell',
+      psScript,
     }
   }
   // cmd.exe stops at the first newline, and chaining with ` & ` changes what the
@@ -1017,6 +1020,51 @@ export function runCommand(request, signal) {
       let { file, args, options, error } = launched
       cleanup = launched.cleanup ?? null
       route.engine = launched.engine ?? route.engine
+
+      // Opt-in persistent host: a PowerShell command is replayed inside a fresh
+      // scope of one long-lived process instead of starting powershell.exe.
+      if (
+        reuseEngineEnabled() &&
+        typeof launched.psScript === 'string' &&
+        (launched.engine === 'powershell' || launched.engine === 'powershell-file')
+      ) {
+        route.engine = 'powershell-reused'
+        // The host runs the script from the payload; drop the file shellCommand
+        // prepared for the one-shot path.
+        launched.cleanup?.()
+        cleanup = null
+        const prologue = "$WarningPreference='Continue';$OutputEncoding=[Text.Encoding]::UTF8;"
+        runReusedPowerShell(prologue + launched.psScript, cwd, timeoutMs, signal).then((result) => {
+          if (result.aborted) {
+            resolve({
+              exitCode: null,
+              signal: null,
+              timedOut: false,
+              aborted: true,
+              durationMs: result.durationMs ?? Date.now() - startedAt,
+              stdout: result.stdout ?? '',
+              stderr: result.stderr ?? '',
+              stdoutEncoding: 'utf-8',
+              stderrEncoding: 'utf-8',
+              truncated: false,
+            })
+            return
+          }
+          resolve({
+            exitCode: result.exitCode,
+            signal: null,
+            timedOut: Boolean(result.timedOut),
+            aborted: false,
+            durationMs: result.durationMs ?? Date.now() - startedAt,
+            stdout: result.stdout ?? '',
+            stderr: result.stderr ?? (result.error ? String(result.error) : ''),
+            stdoutEncoding: 'utf-8',
+            stderrEncoding: 'utf-8',
+            truncated: false,
+          })
+        })
+        return
+      }
 
       if (error) {
         resolve({
