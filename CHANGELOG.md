@@ -1,5 +1,21 @@
 # 更新记录
 
+## v1.9.7
+
+- 修长脚本直接崩：`powershell.exe` 的命令行超过约 4 KB 就 fail-fast（exit `0xc0000409`、
+  **无 stderr、无输出**），而 `-EncodedCommand` 是 UTF-16 脚本的 4/3，约 1.5 KB 的脚本就会撞上。
+  现在 encoded 超过 3000 字符改走临时 `.ps1`（UTF-8+BOM）+ `-File`，实测 50 KB 脚本正常；
+  临时文件在子进程结束时删除（后台 job 在 settle 时删）。
+- 修多行 cmd 的语义：以前把换行替换成 ` & `，`if (...)` 块直接报「此时不应有 &。」，
+  `set X=one` + `echo %X%` 输出字面量 `%X%`（`%VAR%` 在整行解析时就展开了）。
+  现在多行命令落临时 `.bat`（`@echo off`，含非 ASCII 时加 `chcp 65001`）再 `cmd /c`，
+  行语义、块、退出码都对；单行命令仍是直传。
+- 剥掉 PowerShell 5.1 的 CLIXML 外壳：stderr 被重定向时错误记录会被包成
+  `#< CLIXML … _x000D__x000A_`，一条 200 字节的错误回来 750 字节 XML。前台结果与 job 流
+  都还原成普通文本。
+- 原生路径不再为空结果生成临时脚本文件（`execute` 先分流 native 结果）。
+- 测试：exec 87 → 92（多行 cmd 3 项、长脚本 1 项、CLIXML 1 项）；5 套 270 项全绿。
+
 ## v1.9.6
 
 - 修「快而错」的一类静默错：非文件系统盘符的路径（`HKLM:`、`HKCU:`、`Cert:`、`Env:`、`WSMan:`）

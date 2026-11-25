@@ -19,6 +19,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  rmSync,
   statSync,
   writeFileSync,
   writeSync,
@@ -452,6 +453,34 @@ export function unwrapPowerShellInvocation(command) {
     : { script: body }
 }
 
+/** Temporary scripts share the per-user dir that holds the job logs. */
+function writeTempScript(extension, content) {
+  const dir = join(tmpdir(), 'dsh-fastsh')
+  mkdirSync(dir, { recursive: true })
+  const file = join(dir, `script-${randomUUID().slice(0, 8)}.${extension}`)
+  writeFileSync(file, content, 'utf8')
+  return file
+}
+
+function removeTempScript(file) {
+  try {
+    rmSync(file, { force: true })
+  } catch {
+    /* %TEMP% gets cleaned by the OS anyway */
+  }
+}
+
+/**
+ * Windows kills powershell.exe — exit 0xC0000409, no stderr, no output — once
+ * the whole command line passes roughly 4 KB, and `-EncodedCommand` is 4/3 of
+ * the UTF-16 script size, so a ~1.5 KB script already reaches it. Longer scripts
+ * go through a `.ps1` file instead: measured working at 50 KB, and the file is
+ * removed when the child exits.
+ */
+const MAX_ENCODED_CHARS = 3000
+
+const PS_LAUNCH_ARGS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass']
+
 function shellCommand(command, shell) {
   // auto 模式先剥离开头的 `&`（PowerShell 调用运算符的误写），再判断走谁。
   const normalized = stripLeadingCallOperator(command, shell)
@@ -474,17 +503,40 @@ function shellCommand(command, shell) {
       '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;' +
       '$OutputEncoding=[System.Text.Encoding]::UTF8;'
     const encoded = Buffer.from(prologue + psScript, 'utf16le').toString('base64')
+    if (encoded.length > MAX_ENCODED_CHARS) {
+      // UTF-8 + BOM is what PowerShell 5.1 reads correctly for non-ASCII text.
+      const file = writeTempScript('ps1', `\uFEFF${prologue}${psScript}`)
+      return {
+        file: 'powershell.exe',
+        args: [...PS_LAUNCH_ARGS, '-File', file],
+        options: {},
+        cleanup: () => removeTempScript(file),
+      }
+    }
     return {
       file: 'powershell.exe',
-      args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+      args: [...PS_LAUNCH_ARGS, '-EncodedCommand', encoded],
       options: {},
     }
   }
-  // cmd.exe via Node's shell mode: `cmd.exe /d /s /c "<command>"` verbatim,
-  // so the caller's quoting and operators reach cmd unchanged.
-  // cmd.exe stops at the first newline, so a multi-line command silently loses
-  // every line after the first. Chain them with cmd's own separator instead.
-  return { file: script.replace(/\r?\n/g, ' & '), args: [], options: { shell: true } }
+  // cmd.exe stops at the first newline, and chaining with ` & ` changes what the
+  // script means: `if (...)` blocks become syntax errors and `%VAR%` expands
+  // before `set` runs (`set X=1` + `echo %X%` printed the literal). A real .bat
+  // keeps line semantics; non-ASCII literals need the UTF-8 code page.
+  // cmd.exe also caps its own command line at 8191 characters, so a long
+  // single-line command takes the same file route.
+  if (/\r?\n/.test(script) || script.length > 7000) {
+    const nonAscii = /[^\x00-\x7f]/.test(script)
+    const body = `@echo off\r\n${nonAscii ? 'chcp 65001 >nul\r\n' : ''}${script.replace(/\r?\n/g, '\r\n')}\r\n`
+    const file = writeTempScript('bat', body)
+    return {
+      file: 'cmd.exe',
+      args: ['/d', '/s', '/c', file],
+      options: {},
+      cleanup: () => removeTempScript(file),
+    }
+  }
+  return { file: script, args: [], options: { shell: true } }
 }
 
 /**
@@ -803,6 +855,72 @@ function nativeTimedOutResult(startedAt) {
 }
 
 /**
+ * PowerShell 5.1 serialises error records as CLIXML whenever stderr is
+ * redirected: `#< CLIXML\n<Objs …><S S="Error">out-file : …_x000D__x000A_</S></Objs>`.
+ * That wrapper is noise for a human and for the model — one 200-byte message
+ * comes back as ~750 bytes of XML — so it is unwrapped back to plain lines.
+ */
+const CLIXML_ENTITIES = { lt: '<', gt: '>', amp: '&', quot: '"', apos: "'" }
+
+function decodeClixmlXml(xml) {
+  const parts = []
+  for (const match of xml.matchAll(/<S S="[^"]*">([\s\S]*?)<\/S>/g)) {
+    let text = match[1]
+    text = text.replace(/_x([0-9A-Fa-f]{4})_/g, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)))
+    text = text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (entity, body) => {
+      if (body[0] === '#') {
+        const code = body[1] === 'x' || body[1] === 'X' ? Number.parseInt(body.slice(2), 16) : Number(body.slice(1))
+        return Number.isFinite(code) && code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : entity
+      }
+      return CLIXML_ENTITIES[body.toLowerCase()] ?? entity
+    })
+    parts.push(text)
+  }
+  return parts.join('')
+}
+
+/** Unwrap one complete (or partial) CLIXML document; plain text passes through. */
+export function stripClixml(text) {
+  if (typeof text !== 'string' || !text.includes('#< CLIXML')) return text
+  const at = text.indexOf('#< CLIXML')
+  return text.slice(0, at) + decodeClixmlXml(text.slice(at))
+}
+
+/** Stateful variant for job output, which arrives in arbitrary chunks. */
+export function createClixmlFilter() {
+  let buffering = false
+  let buffer = ''
+  const drain = () => {
+    if (!buffer.includes('</Objs>')) return ''
+    const text = decodeClixmlXml(buffer)
+    buffering = false
+    buffer = ''
+    return text
+  }
+  return {
+    push(text) {
+      if (!text) return ''
+      if (buffering) {
+        buffer += text
+        return drain()
+      }
+      const at = text.indexOf('#< CLIXML')
+      if (at === -1) return text
+      buffering = true
+      buffer = text.slice(at)
+      return text.slice(0, at) + drain()
+    },
+    flush() {
+      if (!buffering) return ''
+      const text = decodeClixmlXml(buffer)
+      buffering = false
+      buffer = ''
+      return text
+    },
+  }
+}
+
+/**
  * Run one command to completion.
  * @param {{ command: string, cwd: string, timeoutMs?: number, maxChars?: number,
  *           shell?: 'cmd'|'powershell', encoding?: string, logFile?: string }} request
@@ -835,47 +953,11 @@ export function runCommand(request, signal) {
 
   const execute = (native) =>
     new Promise((resolve) => {
-      let { file, args, options, error } = shellCommand(command, shell)
+      let cleanup = null
 
-    if (error) {
-      resolve({
-        error,
-        exitCode: null,
-        timedOut: false,
-        aborted: false,
-        durationMs: Date.now() - startedAt,
-        stdout: '',
-        stderr: error,
-        stdoutEncoding: 'none',
-        stderrEncoding: 'none',
-        truncated: false,
-      })
-      return
-    }
-
-    if (signal?.aborted) {
-      resolve({
-        exitCode: null,
-        signal: null,
-        timedOut: false,
-        aborted: true,
-        durationMs: 0,
-        stdout: '',
-        stderr: '',
-        stdoutEncoding: 'none',
-        stderrEncoding: 'none',
-        truncated: false,
-      })
-      return
-    }
-
-    if (native) {
-      if (native.delegate) {
-        // `& exe args` runs the target directly, without a shell wrapper.
-        file = native.delegate.file
-        args = native.delegate.args
-        options = {}
-      } else {
+      // Native results never start a process, so they must not pay for a
+      // temporary script file either.
+      if (native && !native.delegate) {
         const out = shape(native.stdout ?? '', maxChars, 'utf-8')
         const err = shape(native.stderr ?? '', maxChars, 'utf-8')
         if (logFile) {
@@ -902,6 +984,48 @@ export function runCommand(request, signal) {
         })
         return
       }
+
+      const launched = shellCommand(command, shell)
+      let { file, args, options, error } = launched
+      cleanup = launched.cleanup ?? null
+
+      if (error) {
+        resolve({
+          error,
+          exitCode: null,
+          timedOut: false,
+          aborted: false,
+          durationMs: Date.now() - startedAt,
+          stdout: '',
+          stderr: error,
+          stdoutEncoding: 'none',
+          stderrEncoding: 'none',
+          truncated: false,
+        })
+        return
+      }
+
+      if (signal?.aborted) {
+      resolve({
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        aborted: true,
+        durationMs: 0,
+        stdout: '',
+        stderr: '',
+        stdoutEncoding: 'none',
+        stderrEncoding: 'none',
+        truncated: false,
+      })
+      return
+    }
+
+    if (native?.delegate) {
+      // `& exe args` runs the target directly, without a shell wrapper.
+      file = native.delegate.file
+      args = native.delegate.args
+      options = {}
     }
 
     // Raw child bytes also go to the caller's log file, so a long run keeps a
@@ -912,6 +1036,7 @@ export function runCommand(request, signal) {
         mkdirSync(dirname(logFile), { recursive: true })
         logFd = openSync(logFile, 'w')
       } catch (error) {
+        cleanup?.()
         resolve({
           error: `cannot open logFile ${logFile}: ${error?.message ?? error}`,
           exitCode: null,
@@ -950,6 +1075,7 @@ export function runCommand(request, signal) {
         ...options,
       })
     } catch (error) {
+      cleanup?.()
       resolve({
         error: error?.message ?? String(error),
         exitCode: null,
@@ -978,6 +1104,7 @@ export function runCommand(request, signal) {
       if (forceTimer) clearTimeout(forceTimer)
       if (signal) signal.removeEventListener('abort', onAbort)
       closeLog()
+      cleanup?.()
       resolve(payload)
     }
 
@@ -990,7 +1117,7 @@ export function runCommand(request, signal) {
         const outText = decodeOutput(out.buffer, encoding)
         const errText = decodeOutput(err.buffer, encoding)
         const shapedOut = shape(outText.text, maxChars, outText.encoding)
-        const shapedErr = shape(errText.text, maxChars, errText.encoding)
+        const shapedErr = shape(stripClixml(errText.text), maxChars, errText.encoding)
         finish({
           exitCode: null,
           signal: null,
@@ -1072,7 +1199,7 @@ export function runCommand(request, signal) {
       const outText = decodeOutput(out.buffer, encoding)
       const errText = decodeOutput(err.buffer, encoding)
       const shapedOut = shape(outText.text, maxChars, outText.encoding)
-      const shapedErr = shape(errText.text, maxChars, errText.encoding)
+      const shapedErr = shape(stripClixml(errText.text), maxChars, errText.encoding)
       finish({
         exitCode,
         signal: exitSignal ?? null,
@@ -1123,7 +1250,8 @@ export function runCommand(request, signal) {
  */
 export function runInBackground(request) {
   const { command, cwd, shell = 'auto', logFile, watch } = request
-  const { file, args, options, error } = shellCommand(command, shell)
+  const launched = shellCommand(command, shell)
+  const { file, args, options, error } = launched
   if (error) throw new Error(error)
   const watchSnapshot = snapshotWatch(watch, cwd)
   const dir = join(tmpdir(), 'dsh-fastsh')
@@ -1157,6 +1285,9 @@ export function runInBackground(request) {
       })
     }
     child.unref()
+    // A temporary .bat/.ps1 must survive until the detached child is done with
+    // it, so it is removed on close rather than right after spawning.
+    if (launched.cleanup) child.on('close', () => launched.cleanup())
     return { pid: child.pid, stdoutPath, stderrPath, command }
   } finally {
     closeSync(out)
@@ -1297,10 +1428,13 @@ export function startBackgroundJob(request) {
     ...(toolCall ? { toolCall } : {}),
     ...(outputLimitBytes ? { outputLimitBytes } : {}),
     run(job) {
-      const { file, args, options, error } = shellCommand(command, shell)
+      const launched = shellCommand(command, shell)
+      const { file, args, options, error } = launched
+      const cleanup = launched.cleanup
       if (error) throw new Error(error)
       const out = createStreamDecoder(encoding)
       const err = createStreamDecoder(encoding)
+      const errClixml = createClixmlFilter()
 
       // 启动前先抓一份产物指纹；命令结束、settle 之前再抓一份并写进 job 输出。
       let watchSnapshot = snapshotWatch(watch, cwd)
@@ -1357,7 +1491,7 @@ export function startBackgroundJob(request) {
       const drainDecoders = () => {
         const restOut = out.flush()
         if (restOut) job.append(restOut, { channel: 'stdout' })
-        const restErr = err.flush()
+        const restErr = errClixml.push(err.flush()) + errClixml.flush()
         if (restErr) job.append(restErr, { channel: 'stderr' })
       }
 
@@ -1369,6 +1503,7 @@ export function startBackgroundJob(request) {
           ...options,
         })
       } catch (error) {
+        cleanup?.()
         settle('failed', error?.message ?? String(error))
         return { cancel() {}, done }
       }
@@ -1380,7 +1515,7 @@ export function startBackgroundJob(request) {
       })
       child.stderr.on('data', (chunk) => {
         writeLog(chunk)
-        const text = err.push(chunk)
+        const text = errClixml.push(err.push(chunk))
         if (text) job.append(text, { channel: 'stderr' })
       })
 
@@ -1388,6 +1523,7 @@ export function startBackgroundJob(request) {
         drainDecoders()
         appendWatch()
         closeLog()
+        cleanup?.()
         settle('failed', error?.message ?? String(error))
       })
 
@@ -1400,6 +1536,7 @@ export function startBackgroundJob(request) {
         drainDecoders()
         appendWatch()
         closeLog()
+        cleanup?.()
         // The registry merges the caller's kill reason into `detail`; do not
         // repeat it here.
         if (killReason !== null) settle('killed')

@@ -86,7 +86,11 @@ watch  out.png
 - 日常命令（`dir`、`type`、`copy`、`git`、`node`、`python`、管道与重定向）用 fastsh。
 - PowerShell 语法（`Get-ChildItem`、`$env:NAME`、`[System.IO.File]::`、管道）也直接交给
   fastsh：常用子集毫秒级原生执行，子集之外自动回退真引擎（~2 s）；`shell: "powershell"`
-  可以强制走真引擎（`-EncodedCommand`，UTF-8 输出）。
+  可以强制走真引擎（UTF-8 输出）。
+- 多行脚本不用手写包装：多行 cmd 会落成临时 `.bat` 再 `cmd /c`（保留 `if` 块与
+  `set`/`%VAR%` 的行语义），长 PowerShell 脚本（encoded > 3000 字符，约 1.5 KB 源文本）
+  会落成临时 `.ps1` 用 `-File` 跑——`-EncodedCommand` 超过约 4 KB 会让 `powershell.exe`
+  直接 fail-fast（exit `0xc0000409`、无输出），走文件没有这个上限。
 - 长任务用 `run_in_background: true`：它成为 DSH 原生 job，`job_list` 能看到，
   `job_output` 可以流式读，`job_kill` 能停，会话结束时随所属 Agent 一起回收。
 
@@ -391,6 +395,11 @@ jobs 的完成/失败/取消、`outputLimitBytes`、
 - `cmd.exe` 语法与 PowerShell 不同，不能混用：`auto` 只能挑一个后端，混合行必有一半失败，
   所以提示词要求"整行只用一种 shell"。`2>&1` / `*>&1` 两个 shell 都合法，不再参与判定；
   `>nul` / `2>nul` / `>>nul` 在选定 PowerShell 后会改写成 `$null`（引号内不动）。
+- 临时脚本落在 `%TEMP%\dsh-fastsh\script-*.{bat,ps1}`：前台和 job 在子进程结束时删除，
+  分离后台进程在它 `close` 后删除。`-File` 模式下 `$PSScriptRoot` / `$PSCommandPath`
+  指向临时文件的目录，不是空字符串（`-EncodedCommand` 时为空）。
+- PowerShell 5.1 在 stderr 被重定向时会把错误记录包成 CLIXML XML（`#< CLIXML …`，
+  一条 200 字节的错误约 750 字节）；fastsh 会剥掉外壳还原成普通文本，job 流同样处理。
 - `job_list` 里 kind 显示为 `bash`，这是 DSH 目前唯一的 job 类型名，不代表用了 bash。
 - 没有 jobs 服务时后台任务回退为分离进程，此时用 `pid` + `taskkill` 管理。
 - 超时后如果进程树仍持有管道句柄，结果最多延迟 5 秒返回（兜底定时器）。

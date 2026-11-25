@@ -549,6 +549,44 @@ function check(name, ok, detail) {
   )
 }
 
+// 27. 多行 cmd 必须保留行语义（` & ` 拼接会把 if 块和作用域弄错）
+{
+  const scope = await runCommand({ command: 'set X=one\necho value=%X%', cwd: process.cwd() })
+  check('cmd multi-line var scope', scope.exitCode === 0 && scope.stdout.includes('value=one'), JSON.stringify(scope.stdout.trim().slice(0, 40)))
+
+  const block = await runCommand({ command: 'if exist C:\\Windows (\n  echo ok1\n  echo ok2\n)', cwd: process.cwd() })
+  check(
+    'cmd multi-line if block',
+    block.exitCode === 0 && block.stdout.includes('ok1') && block.stdout.includes('ok2'),
+    JSON.stringify(block.stdout.trim().slice(0, 40)),
+  )
+
+  const code = await runCommand({ command: 'echo before\nexit /b 7', cwd: process.cwd() })
+  check('cmd multi-line exit code', code.exitCode === 7 && code.stdout.includes('before'), String(code.exitCode))
+}
+
+// 28. 长脚本走临时 .ps1，不再撞 powershell.exe 的命令行上限
+{
+  const script = Array.from({ length: 400 }, (_, i) => `$x${i} = ${i}`).join('\n') + '\nWrite-Output "long-ok"'
+  const r = await runCommand({ command: script, cwd: process.cwd(), shell: 'powershell' })
+  check(
+    'long inline script runs',
+    r.exitCode === 0 && r.stdout.includes('long-ok'),
+    `${r.durationMs}ms exit=${r.exitCode} ${JSON.stringify(String(r.stderr).slice(0, 60))}`,
+  )
+}
+
+// 29. PowerShell 错误的 CLIXML 外壳被剥掉
+{
+  const r = await runCommand({ command: "Get-ItemProperty 'HKLM:\\no-such-key-xyz' -Name X", cwd: process.cwd() })
+  const stderr = String(r.stderr ?? '')
+  check(
+    'clixml stripped',
+    r.exitCode === 1 && !stderr.includes('CLIXML') && !stderr.includes('_x000D_') && stderr.trim().length > 0,
+    JSON.stringify(stderr.slice(0, 80)),
+  )
+}
+
 const failed = results.filter((r) => !r.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 process.exit(failed.length ? 1 : 0)
