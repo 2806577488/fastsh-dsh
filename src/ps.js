@@ -1897,7 +1897,10 @@ function runStatement(statement, context, depth) {
     return { delegate: parseCallOperator(body, context) }
   }
 
-  const stderrTarget = redirect?.stream === 'stderr' ? toPath(redirect.target, context) : null
+  // `$null` is PowerShell's discard device. Treating it as a file name writes a
+  // stray `$null` file into the cwd — something real PowerShell never does.
+  const nullTarget = redirect ? /^\$null$/i.test(String(redirect.target ?? '').trim()) : false
+  const stderrTarget = redirect?.stream === 'stderr' && !nullTarget ? toPath(redirect.target, context) : null
 
   try {
     const text = render(runPipeline(body, context))
@@ -1907,6 +1910,8 @@ function runStatement(statement, context, depth) {
       return { text }
     }
     if (redirect) {
+      // `2> $null` hides stderr only; stdout still prints.
+      if (nullTarget) return { text: redirect.stream === 'stderr' ? text : '' }
       const path = toPath(redirect.target, context)
       if (redirect.append) appendFileSync(path, `${text}\n`, 'utf8')
       else writeFileSync(path, `${text}\n`, 'utf8')
@@ -1914,7 +1919,10 @@ function runStatement(statement, context, depth) {
     }
     return { text }
   } catch (error) {
-    if (stderrTarget && !(error && error[UNSUPPORTED])) {
+    if (error && (error[UNSUPPORTED] || error[REFUSED])) throw error
+    // `2> $null` hides the error record, which is what PowerShell does.
+    if (nullTarget) return { text: '' }
+    if (stderrTarget) {
       // Deliberately UTF-8; PowerShell 5.1 would write UTF-16LE here.
       writeFileSync(stderrTarget, `${error?.message ?? String(error)}\n`, 'utf8')
       return { text: '' }

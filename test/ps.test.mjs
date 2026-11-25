@@ -641,6 +641,27 @@ const check = (name, cond, detail) => (cond ? ok : bad).push(`${name} ${detail ?
   rmSync(root, { recursive: true, force: true })
 }
 
+// redirect into $null must discard, not create a file named `$null`
+{
+  const root = 'test/tmp-null-redirect'
+  rmSync(root, { recursive: true, force: true })
+  mkdirSync(root, { recursive: true })
+  const runIn = (command) => runNativePowerShell(command, { cwd: resolve(root), env: process.env })
+
+  const outR = runIn('Get-Date > $null')
+  check('> $null discards stdout', outR && outR.exitCode === 0 && outR.stdout === '', JSON.stringify(outR?.stdout))
+  check('> $null writes no $null file', !existsSync(`${root}/$null`), '')
+
+  const errR = runIn('Get-Date 2> $null')
+  check('2> $null keeps stdout', errR && errR.exitCode === 0 && errR.stdout.length > 0, JSON.stringify(errR?.stdout?.slice(0, 24)))
+  check('2> $null writes no $null file', !existsSync(`${root}/$null`), '')
+
+  const fileR = runIn('Get-Date > out.txt')
+  check('> file still writes', fileR && fileR.exitCode === 0 && existsSync(`${root}/out.txt`), '')
+
+  rmSync(root, { recursive: true, force: true })
+}
+
 console.log('PASS:\n  ' + ok.join('\n  '))
 if (bad.length) {
   console.log('FAIL:\n  ' + bad.join('\n  '))

@@ -79,6 +79,11 @@ check('name', definition?.name === 'fastsh', definition?.name)
 check('has output.render', typeof definition?.output?.render === 'function')
 check('has execute', typeof definition?.execute === 'function')
 check('prompt section added', sections.length === 1, JSON.stringify(sections[0]?.name))
+check(
+  'prompt forbids mixed shells',
+  typeof sections[0]?.text === 'string' && sections[0].text.includes('Never mix the two shells'),
+  '',
+)
 check('jobs controller attached', attached === 1, String(attached))
 
 // pwsh is replaced, not merely discouraged

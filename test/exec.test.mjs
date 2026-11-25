@@ -490,6 +490,32 @@ function check(name, ok, detail) {
   check('start-sleep native end-to-end', r.exitCode === 0 && elapsed < 1500, `${elapsed}ms`)
 }
 
+// 24. `2>&1` is a stream redirect both shells accept, so it must not pick cmd
+{
+  check('detect: 2>&1 stays PowerShell', detectPowerShell('Get-Date 2>&1 | Out-Null') === true, '')
+  check('detect: cmd 2>&1 stays cmd', detectPowerShell('dir /b 2>&1') === false, '')
+  check('detect: && still belongs to cmd', detectPowerShell('Get-Date && echo x') === false, '')
+  const r = await runCommand({
+    command: "$guids = 'a','b'\nforeach ($g in $guids) {\n  echo $g 2>&1 | Out-Null\n  \"ran $g\"\n}",
+    cwd: process.cwd(),
+  })
+  check(
+    '2>&1 script stays on PowerShell',
+    r.exitCode === 0 && r.stdout.includes('ran a') && r.stdout.includes('ran b'),
+    JSON.stringify(r.stdout.slice(0, 60)),
+  )
+}
+
+// 25. cmd's `>nul` is a device only in cmd; on a PowerShell line it means $null
+{
+  const nul = await runCommand({ command: 'Get-Date >nul', cwd: process.cwd() })
+  check('>nul discards', nul.exitCode === 0 && nul.stdout.trim() === '', JSON.stringify({ exit: nul.exitCode, out: nul.stdout }))
+  const date = await runCommand({ command: 'Get-Date 2>nul', cwd: process.cwd() })
+  check('2>nul keeps stdout', date.exitCode === 0 && date.stdout.trim().length > 0, JSON.stringify(date.stdout.slice(0, 30)))
+  const quoted = await runCommand({ command: 'Write-Output "see >nul here"', cwd: process.cwd() })
+  check('quoted >nul untouched', quoted.exitCode === 0 && quoted.stdout.includes('see >nul here'), JSON.stringify(quoted.stdout))
+}
+
 const failed = results.filter((r) => !r.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 process.exit(failed.length ? 1 : 0)

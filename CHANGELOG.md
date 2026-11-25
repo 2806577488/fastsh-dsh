@@ -1,5 +1,19 @@
 # 更新记录
 
+## v1.9.5
+
+- 修 `auto` 把 PowerShell 脚本判给 cmd：`2>&1` / `*>&1` 是流重定向（cmd 与 PowerShell 5.1
+  都合法），此前被当成 cmd 的 `&` 连接符，整段带 `2>&1` 的多行脚本被送进 cmd.exe
+  （表现为「此时不应有 …」或「'foreach' 不是内部或外部命令」）。现在判定前先抹掉重定向。
+- cmd 的 `>nul` / `2>nul` / `>>nul` 在选定 PowerShell 后改写为 `$null`：此前原样进真引擎，
+  `Out-File` 报「要求 FileStream 打开一个不是文件的设备」。引号内的文本不动。
+- 原生子集的 `> $null` / `2> $null` 改为真正丢弃：此前会往 cwd 写一个名为 `$null` 的空文件；
+  `2>` 重定向也不再吞掉删除护栏的拒绝。
+- 提示词新增：一条命令只用一种 shell——cmd 专属语法（`>nul`、`2>nul`、`%VAR%`、`&&`）与
+  PowerShell 专属语法（cmdlet、`$env:`、`{ }`）混写时 `auto` 只能选一个后端，必有一半失败；
+  需要两种时拆成两条并显式传 `shell`。上下文预算仍 ≤ 6500 字符。
+- 测试：exec 76 → 83、ps 105 → 110、plugin 25 → 26。
+
 ## v1.9.4
 
 - `New-Item -ItemType File` 不再截断已存在文件：无 `-Force` 报错，有 `-Force` 返回原文件

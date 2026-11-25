@@ -385,7 +385,9 @@ jobs 的完成/失败/取消、`outputLimitBytes`、
 
 ## 已知边界
 
-- `cmd.exe` 语法与 PowerShell 不同，不能混用。
+- `cmd.exe` 语法与 PowerShell 不同，不能混用：`auto` 只能挑一个后端，混合行必有一半失败，
+  所以提示词要求"整行只用一种 shell"。`2>&1` / `*>&1` 两个 shell 都合法，不再参与判定；
+  `>nul` / `2>nul` / `>>nul` 在选定 PowerShell 后会改写成 `$null`（引号内不动）。
 - `job_list` 里 kind 显示为 `bash`，这是 DSH 目前唯一的 job 类型名，不代表用了 bash。
 - 没有 jobs 服务时后台任务回退为分离进程，此时用 `pid` + `taskkill` 管理。
 - 超时后如果进程树仍持有管道句柄，结果最多延迟 5 秒返回（兜底定时器）。

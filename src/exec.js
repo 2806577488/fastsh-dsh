@@ -326,6 +326,60 @@ function blankQuoted(text) {
   return out
 }
 
+/**
+ * `2>&1` / `*>&1` is a stream redirection, valid in cmd **and** PowerShell 5.1.
+ * It must be blanked before the `&` test, otherwise a mid-line `&` that is not
+ * a cmd separator sends a whole PowerShell script to cmd.exe.
+ */
+const STREAM_REDIRECT = /(?:\d|\*)?>&(?:\d|\*)/g
+
+/**
+ * cmd's `>nul` is a device; to PowerShell it is just a file name, and Out-File
+ * fails with "要求 FileStream 打开一个不是文件的设备". `>nul` and `>$null` mean
+ * the same thing, so a line that ends up on the real engine is rewritten.
+ */
+const NULL_REDIRECT = />{1,2}\s*nul(?![A-Za-z0-9_.])/i
+
+/**
+ * Same length as the input, with every quoted span replaced by spaces, so the
+ * rewrite below never touches text the user quoted.
+ */
+function maskQuoted(text) {
+  let out = ''
+  let quote = null
+  for (const ch of text) {
+    if (quote) {
+      if (ch === quote) quote = null
+      out += ' '
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      out += ' '
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+/**
+ * Rewrite `>nul` / `2>nul` / `>>nul` to `$null` outside quoted spans. Offsets
+ * match one to one, so the replacement is spliced into the user's own text.
+ */
+function rewriteNullDevice(text) {
+  const masked = maskQuoted(text)
+  let out = ''
+  let last = 0
+  for (const match of masked.matchAll(new RegExp(NULL_REDIRECT.source, 'gi'))) {
+    const start = match.index
+    const arrow = match[0].startsWith('>>') ? '>>' : '>'
+    out += text.slice(last, start) + `${arrow}${'$'}null`
+    last = start + match[0].length
+  }
+  return out + text.slice(last)
+}
+
 export function detectPowerShell(command) {
   if (typeof command !== 'string' || command.length === 0) return false
 
@@ -334,11 +388,13 @@ export function detectPowerShell(command) {
 
   // Quoted spans are blanked so markers inside strings never decide the shell.
   const bare = blankQuoted(command)
+  // `2>&1` 是流重定向（cmd 和 PowerShell 都认），不是 cmd 的 `&` 连接符。
+  const ops = bare.replace(STREAM_REDIRECT, '     ')
 
   // `&&` and a mid-line `&` belong to cmd: PowerShell 5.1 rejects `&&`, and
   // routing such a command to PowerShell would only produce a syntax error.
-  if (bare.includes('&&')) return false
-  if (bare.indexOf('&') > 0) return false
+  if (ops.includes('&&')) return false
+  if (ops.indexOf('&') > 0) return false
 
   // A leading `&` is PowerShell's call operator.
   if (/^\s*&/.test(bare)) return true
@@ -410,12 +466,14 @@ function shellCommand(command, shell) {
     (shell !== 'cmd' && (unwrapped !== null || detectPowerShell(script)))
 
   if (usePowerShell) {
+    // cmd 的 `>nul` 在 PowerShell 里是文件名；改成等价写法再交给真引擎。
+    const psScript = rewriteNullDevice(script)
     const prologue =
       "$ProgressPreference='SilentlyContinue';" +
       "$WarningPreference='Continue';" +
       '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;' +
       '$OutputEncoding=[System.Text.Encoding]::UTF8;'
-    const encoded = Buffer.from(prologue + script, 'utf16le').toString('base64')
+    const encoded = Buffer.from(prologue + psScript, 'utf16le').toString('base64')
     return {
       file: 'powershell.exe',
       args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
