@@ -193,8 +193,9 @@ permission (@deepseek-ai/dsh-permission-presets): pending (waiting for service: 
 | 类别 | 支持 |
 |---|---|
 | 文件 | `Get-ChildItem`（`-Name/-File/-Directory/-Recurse/-Filter/-Depth`）、`Get-Item`、`Get-Content`（`-Raw/-TotalCount/-Tail/-Encoding`，BOM 自动识别）、`Set-Content`/`Add-Content`（显式 `-Encoding`）、`New-Item`（**不截断已存在文件**）、`Remove-Item`、`Copy-Item`/`Move-Item`（目标为已存在目录时放进目录内）、`Test-Path`、`Join-Path`、`Split-Path`、`Get-Location`、`Resolve-Path`、`Get-FileHash`（`-Algorithm SHA256/SHA1/MD5`，可接管道，1 MiB 分块流式） |
+| 注册表（只读） | `HKLM:`/`HKCU:`/`HKCR:`/`HKU:`/`HKCC:` 上的 `Test-Path`（含 `-PathType`）、`Get-ItemProperty`（`-Name` 或整键的标量值，走 `reg.exe`，约 20 ms）、`Get-ChildItem -Name`（列子键名） |
 | 管道 | `Select-Object`（`-First/-Last/-Skip/-Property/-ExpandProperty/-Unique`）、`Where-Object`（属性比较）、`ForEach-Object`（属性取值）、`Sort-Object`、`Measure-Object` |
-| 进程与时间 | `Get-Process`（`-Name/-Id`，走 tasklist，约 0.3 s）、`Get-Date`（`-Format` 支持 .NET 格式串）、`Start-Sleep`（`-Seconds`/`-Milliseconds`，含 `sleep` 别名；原生等待，>30 s 回退真引擎） |
+| 进程与时间 | `Get-Process`（`-Name`/位置参数/`-Id`，走 tasklist，约 0.3 s；`Path`/`Modules` 等 tasklist 拿不到的属性一读就回退）、`Get-Date`（`-Format` 支持 .NET 格式串）、`Start-Sleep`（`-Seconds`/`-Milliseconds`，含 `sleep` 别名；原生等待，>30 s 回退真引擎） |
 | 文本与序列化 | `Select-String`（`-Path/-Pattern/-SimpleMatch/-CaseSensitive/-NotMatch`，输出 `路径:行号:内容`）、`Out-File`（`-Encoding/-Append`）、`Tee-Object`（`-FilePath/-Append`，透传）、`ConvertTo-Json`（`-Compress`）、`ConvertFrom-Json`（接字符串或 `Get-Content` 行）、`Format-Table/List/Wide` 与 `Out-String`（透传，由渲染器排版） |
 | 错误处理 | `-ErrorAction SilentlyContinue/Ignore`（`-EA` 别名）抑制真实的文件系统错误；**护栏拒绝永不被抑制** |
 | .NET 静态调用 | `[System.IO.File]::`（Exists/ReadAllText/ReadAllLines/WriteAllText/AppendAllText/Delete/Copy/Move）、`[System.IO.Directory]::`（含 Delete）、`[System.IO.Path]::`、`[Environment]::`、`[math]::`、`[Guid]::NewGuid`、`[DateTime]::Now/UtcNow/Today/Parse` |
@@ -207,6 +208,8 @@ permission (@deepseek-ai/dsh-permission-presets): pending (waiting for service: 
 **仍然回退真实 PowerShell** 的只剩：
 
 - 未知 cmdlet（如 `Get-ADUser`）或未知 .NET 类型；
+- 注册表里**不是标量**或**不是单键**的形态：`Get-Item`/不带 `-Name` 的 `Get-ChildItem`（返回 RegistryKey 对象）、通配符路径、`REG_BINARY`/`REG_MULTI_SZ`/`REG_NONE` 值、`Cert:`/`Env:`/`WSMan:` 等其他 provider 盘符、`Set-ItemProperty` 等写操作；
+- `Get-Process` 的 `Path`/`Modules`/`StartTime`/`Company` 等 tasklist 拿不到的属性——**读它就回退**，不会静默给空（`tasklist` 只给 Id/ProcessName/SessionName/WorkingSet）；模块列表用原生 `tasklist /m /fi "imagename eq x.exe" /fo csv /nh`；
 - `@{...}` 哈希表、`@(...)` 数组表达式；
 - 路径参数里还留有无法精确展开的 `$` 引用，例如 `"$HOME\Documents"`、`$env:X\f`——字符串内的变量插值只有真实引擎做；读命令回退真实引擎，删除命令直接拒绝（见上文护栏），都不会把 `$HOME` 当目录名；
 - `$HOME` 在环境里拿不到值（`USERPROFILE`/`HOME` 都为空）时回退，而不是静默拼出空路径；

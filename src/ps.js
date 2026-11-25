@@ -182,8 +182,103 @@ function toPath(value, context) {
   // silently become the working directory, which is never what the caller meant.
   if (text === '') nope(`path resolves to nothing: ${raw}`)
   if (text.includes('$')) nope(`path interpolation: ${text}`)
+  // Drive-qualified paths that are not filesystem drives (`HKLM:`, `Cert:`,
+  // `Env:`, …) used to be glued onto the cwd and turned into ``C:\cwd\HKLM:\…``,
+  // so Test-Path answered False for existing keys. Leave them to real PowerShell
+  // unless a cmdlet handles the drive itself (the registry cmds do, above).
+  if (/^[A-Za-z]{2,}:(?=[\\/]|$)/.test(text)) nope(`non-filesystem drive path: ${text}`)
+  if (/^[A-Za-z][\w.]*(?:\\[A-Za-z][\w.]*)*::/.test(text)) nope(`provider path: ${text}`)
   if (text === '.') return context.cwd
   return isAbsolute(text) ? text : resolve(context.cwd, text)
+}
+
+// ---------------------------------------------------------------------------
+// Registry PSDrive — read-only, backed by reg.exe
+// ---------------------------------------------------------------------------
+
+const REG_HIVES = new Map([
+  ['HKLM', 'HKEY_LOCAL_MACHINE'],
+  ['HKCU', 'HKEY_CURRENT_USER'],
+  ['HKCR', 'HKEY_CLASSES_ROOT'],
+  ['HKU', 'HKEY_USERS'],
+  ['HKCC', 'HKEY_CURRENT_CONFIG'],
+])
+
+/** Marks an object that carries registry values, for list-style rendering. */
+const REGISTRY_VALUES = Symbol('fastsh.ps.registryValues')
+
+function markRegistry(values) {
+  Object.defineProperty(values, REGISTRY_VALUES, { value: true })
+  return values
+}
+
+/**
+ * `HKLM:\SOFTWARE\x` → the reg.exe key `HKEY_LOCAL_MACHINE\SOFTWARE\x`.
+ * Returns null for anything that is not a registry path; wildcards decline to
+ * the real engine instead of listing the wrong subtree.
+ */
+function registryTarget(value, context) {
+  if (typeof value !== 'string' || !value) return null
+  const text = String(valueOf(value, context) ?? '').trim()
+  const match = /^([A-Za-z]{2,}):(.*)$/.exec(text)
+  if (!match) return null
+  const hive = REG_HIVES.get(match[1].toUpperCase())
+  if (!hive) return null
+  const rest = match[2].replace(/^[\\/]+/, '').replace(/[\\/]+$/, '')
+  if (/[*?]/.test(rest)) nope(`registry wildcard: ${text}`)
+  return { key: rest ? `${hive}\\${rest.replace(/\//g, '\\')}` : hive, path: text }
+}
+
+/** `reg query` output, or null when the key is not there (denied → fallback). */
+function regQuery(key) {
+  try {
+    const raw = execFileSync('reg.exe', ['query', key], {
+      encoding: 'buffer',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    return decodeBytes(raw)
+  } catch (error) {
+    const stderr = error?.stderr ? decodeBytes(error.stderr) : ''
+    if (/拒绝访问|Access is denied/i.test(stderr)) nope(`registry access denied: ${key}`)
+    return null
+  }
+}
+
+/** The value block of `reg query` output: name → { type, data }. */
+function regValues(text) {
+  const values = new Map()
+  for (const line of text.split(/\r?\n/)) {
+    if (!line || /^HKEY_/i.test(line.trim())) continue
+    const match = /^ {4}(.+?) {4}(REG_[A-Z_0-9]+)(?: {4}([\s\S]*))?$/.exec(line)
+    if (!match) continue
+    values.set(match[1], { type: match[2], data: match[3] ?? '' })
+  }
+  return values
+}
+
+/** PowerShell-shaped scalar for one value; null when it has no scalar form. */
+function registryScalar({ type, data }) {
+  if (type === 'REG_SZ' || type === 'REG_EXPAND_SZ') return data
+  if (type === 'REG_DWORD' || type === 'REG_QWORD') {
+    const parsed = Number.parseInt(data.replace(/^0x/i, ''), 16)
+    return Number.isSafeInteger(parsed) ? parsed : null
+  }
+  // REG_BINARY / REG_MULTI_SZ / REG_NONE need PowerShell's array shapes.
+  return null
+}
+
+/** Leaf names of the subkeys in `reg query` output. */
+function regSubkeys(text, key) {
+  const names = []
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || /^ {4}/.test(line) || !/^HKEY_/i.test(trimmed)) continue
+    if (trimmed.toLowerCase() === key.toLowerCase()) continue
+    const leaf = trimmed.slice(trimmed.lastIndexOf('\\') + 1)
+    if (leaf) names.push(leaf)
+  }
+  return names
 }
 
 /** Case-insensitive, separator-normalised form used by the delete guard. */
@@ -669,7 +764,24 @@ function runCmdlet(stage, input, context) {
     case 'gci':
     case 'dir':
     case 'ls': {
-      const path = toPath(param(params, 'path') ?? args[0], context)
+      const rawPath = param(params, 'path') ?? args[0]
+      const registry = registryTarget(rawPath, context)
+      if (registry) {
+        // `Get-ChildItem HKLM:\x` returns RegistryKey objects (PSPath, Property,
+        // …) that this subset cannot reproduce, so only `-Name` is faithful.
+        if (!truthy(params.get('name'))) nope('registry listing returns provider objects')
+        if (
+          truthy(params.get('recurse')) ||
+          param(params, 'filter') !== undefined ||
+          param(params, 'depth') !== undefined
+        ) {
+          nope('registry listing option')
+        }
+        const listing = regQuery(registry.key)
+        if (listing === null) nope('registry key not found')
+        return regSubkeys(listing, registry.key)
+      }
+      const path = toPath(rawPath, context)
       const filter = param(params, 'filter')
       const depthParam = param(params, 'depth')
       const depth =
@@ -692,8 +804,53 @@ function runCmdlet(stage, input, context) {
       const path = toPath(param(params, 'path') ?? args[0], context)
       return shapeItem(path)
     }
+    case 'get-itemproperty':
+    case 'gp': {
+      const rawPath = param(params, 'path') ?? args[0]
+      const registry = registryTarget(rawPath, context)
+      if (!registry) nope('get-itemproperty outside the registry')
+      const listing = regQuery(registry.key)
+      if (listing === null) nope('registry key not found')
+      const values = regValues(listing)
+      // Registry value names are case-insensitive; keep the canonical spelling.
+      const canonical = new Map([...values.keys()].map((name) => [name.toLowerCase(), name]))
+      const requested = param(params, 'name')
+      if (requested !== undefined) {
+        const picked = {}
+        const names = String(valueOf(requested, context))
+          .split(',')
+          .map((name) => name.trim())
+          .filter(Boolean)
+        for (const name of names) {
+          const key = canonical.get(name.toLowerCase())
+          // A missing value is a real PowerShell error; let the real engine say it.
+          if (!key) nope(`registry value not found: ${name}`)
+          const scalar = registryScalar(values.get(key))
+          if (scalar === null) nope(`registry value has no scalar form: ${key}`)
+          picked[key] = scalar
+        }
+        return markRegistry(picked)
+      }
+      // Without values only PowerShell's PS* pseudo-properties remain, and the
+      // binary/array types have shapes this subset cannot render.
+      if (values.size === 0) nope('registry key has no values')
+      const all = {}
+      for (const [name, entry] of values) {
+        const scalar = registryScalar(entry)
+        if (scalar === null) nope(`registry value has no scalar form: ${name}`)
+        all[name] = scalar
+      }
+      return markRegistry(all)
+    }
     case 'test-path': {
-      const path = toPath(param(params, 'path') ?? args[0], context)
+      const rawPath = param(params, 'path') ?? args[0]
+      const registry = registryTarget(rawPath, context)
+      if (registry) {
+        if (regQuery(registry.key) === null) return false
+        // A registry key is a container; there are no leaves in this drive.
+        return String(valueOf(param(params, 'pathtype') ?? 'any', context)).toLowerCase() !== 'leaf'
+      }
+      const path = toPath(rawPath, context)
       const pathType = String(valueOf(param(params, 'pathtype') ?? 'any', context)).toLowerCase()
       if (!existsSync(path)) return false
       if (pathType === 'leaf') return statSync(path).isFile()
@@ -845,8 +1002,13 @@ function runCmdlet(stage, input, context) {
     case 'gps':
     case 'ps': {
       const rows = listProcesses()
-      const name = param(params, 'name')
-      if (name) return rows.filter((row) => matchesFilter(row.ProcessName, String(valueOf(name, context))))
+      // `Get-Process explorer` filters by name through the positional argument,
+      // exactly like `-Name`.
+      const name = param(params, 'name') ?? (args.length ? args[0] : undefined)
+      if (name !== undefined) {
+        const wanted = String(valueOf(name, context))
+        return rows.filter((row) => matchesFilter(row.ProcessName, wanted))
+      }
       const id = param(params, 'id')
       if (id) {
         const wanted = String(valueOf(id, context))
@@ -1001,10 +1163,22 @@ function runCmdlet(stage, input, context) {
       const last = param(params, 'last')
       if (last !== undefined) values = values.slice(-Number(valueOf(last, context)))
       const expand = param(params, 'expandproperty')
-      if (expand) return values.map((value) => value?.[String(valueOf(expand, context))])
-      const property = param(params, 'property')
-      if (property) {
-        const keys = String(valueOf(property, context))
+      if (expand) {
+        const key = String(valueOf(expand, context))
+        return values.map((value) => {
+          // Real PowerShell errors when the property is not on the object, so a
+          // silent empty answer would hide a property the subset cannot model
+          // (e.g. Get-Process Path/Modules come from tasklist, which lacks them).
+          if (value && typeof value === 'object' && !(key in value)) nope(`expandproperty: ${key}`)
+          return value?.[key]
+        })
+      }
+      const property = param(params, 'property') ?? (args.length ? args.join(',') : undefined)
+      if (property !== undefined) {
+        const text = String(valueOf(property, context))
+        // `*` and calculated properties (`@{Name=…;Expression=…}`) are not modelled.
+        if (text.trim() === '*' || text.includes('@{')) nope(`select-object property ${text.slice(0, 20)}`)
+        const keys = text
           .split(',')
           .map((key) => key.trim())
           .filter(Boolean)
@@ -1273,6 +1447,13 @@ function renderValue(value) {
 function render(values) {
   const list = Array.isArray(values) ? values : [values]
   if (list.length === 0) return ''
+
+  // Registry values render like PowerShell's list view (`Name : value`).
+  if (list.every((value) => value && typeof value === 'object' && value[REGISTRY_VALUES])) {
+    return list
+      .map((value) => Object.entries(value).map(([key, item]) => `${key} : ${renderValue(item)}`).join('\n'))
+      .join('\n')
+  }
 
   const objects = list.filter((value) => value && typeof value === 'object' && !(value instanceof Date))
   if (objects.length !== list.length) return list.map(renderValue).join('\n')
@@ -1714,7 +1895,20 @@ function resolveReference(text, context) {
   const match = text.match(/^(\$[A-Za-z_][\w:]*|\$_)((?:\.[A-Za-z_]\w*)*)$/)
   if (!match) nope(`reference ${text}`)
   let value = valueOf(match[1], context)
-  for (const prop of match[2].split('.').filter(Boolean)) value = value?.[prop]
+  for (const prop of match[2].split('.').filter(Boolean)) {
+    // PowerShell enumerates members across a collection: `$procs.Path` is the
+    // list of paths. Reading the property off the array itself would answer
+    // "nothing" and hide a property this subset cannot model.
+    if (Array.isArray(value)) {
+      if (prop === 'Length' || prop === 'Count') {
+        value = value.length
+        continue
+      }
+      value = value.map((item) => (item && typeof item === 'object' ? item[prop] : undefined))
+      continue
+    }
+    value = value?.[prop]
+  }
   return value
 }
 
@@ -1931,6 +2125,54 @@ function runStatement(statement, context, depth) {
   }
 }
 
+/**
+ * Process properties `tasklist` cannot supply (no module list, no image path).
+ * Reading one must fall back to PowerShell instead of answering "nothing" with
+ * exit code 0 — that silent gap is what made `Select-Object -ExpandProperty
+ * Path` look successful while printing an empty line.
+ */
+const PROCESS_UNSUPPORTED = [
+  'Path',
+  'Modules',
+  'StartTime',
+  'ExitTime',
+  'Company',
+  'Description',
+  'FileVersion',
+  'Product',
+  'ProductVersion',
+  'MainWindowTitle',
+  'MainWindowHandle',
+  'HandleCount',
+  'Threads',
+  'CPU',
+  'PM',
+  'VM',
+  'WS',
+  'SI',
+  'PriorityClass',
+  'BasePriority',
+  'Responding',
+  'PeakWorkingSet',
+  'PrivateMemorySize',
+  'VirtualMemorySize',
+]
+
+function partialProcessRow(row) {
+  // PowerShell's `Name` is the same value as `ProcessName`.
+  Object.defineProperty(row, 'Name', { enumerable: false, configurable: true, get: () => row.ProcessName })
+  for (const prop of PROCESS_UNSUPPORTED) {
+    Object.defineProperty(row, prop, {
+      enumerable: false,
+      configurable: true,
+      get() {
+        nope(`process property not in the native subset: ${prop}`)
+      },
+    })
+  }
+  return row
+}
+
 function listProcesses() {
   const raw = execFileSync('tasklist.exe', ['/FO', 'CSV', '/NH'], { encoding: 'buffer', windowsHide: true })
   return decodeBytes(raw)
@@ -1939,12 +2181,12 @@ function listProcesses() {
     .map((line) => {
       const cells = line.slice(1, -1).split('","')
       const kb = Number(String(cells[4] ?? '').replace(/[^\d]/g, '') || 0)
-      return {
+      return partialProcessRow({
         Id: Number(cells[1] ?? 0),
         ProcessName: String(cells[0] ?? '').replace(/\.exe$/i, ''),
         SessionName: cells[2] ?? '',
         WorkingSet: kb * 1024,
-      }
+      })
     })
 }
 

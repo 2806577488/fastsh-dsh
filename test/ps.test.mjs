@@ -662,6 +662,50 @@ const check = (name, cond, detail) => (cond ? ok : bad).push(`${name} ${detail ?
   rmSync(root, { recursive: true, force: true })
 }
 
+// registry PSDrive: read-only, backed by reg.exe
+{
+  const existing = run("Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'")
+  check('test-path registry existing', existing && existing.exitCode === 0 && existing.stdout === 'True', JSON.stringify(existing?.stdout))
+  const missing = run("Test-Path 'HKLM:\\no-such-key-xyz'")
+  check('test-path registry missing', missing && missing.exitCode === 0 && missing.stdout === 'False', JSON.stringify(missing?.stdout))
+  const hkcu = run("Test-Path 'HKCU:\\Environment'")
+  check('test-path HKCU drive', hkcu && hkcu.stdout === 'True', JSON.stringify(hkcu?.stdout))
+  const leaf = run("Test-Path 'HKLM:\\SOFTWARE' -PathType Leaf")
+  check('test-path registry -PathType Leaf', leaf && leaf.stdout === 'False', JSON.stringify(leaf?.stdout))
+
+  const props = run("Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion' -Name ProductName")
+  check('get-itemproperty -Name', props && props.exitCode === 0 && /^ProductName : .+$/m.test(props.stdout), JSON.stringify(props?.stdout))
+
+  const names = run("Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft' -Name")
+  check(
+    'get-childitem registry -Name',
+    names && names.exitCode === 0 && names.stdout.split('\n').includes('Windows'),
+    JSON.stringify(names?.stdout?.slice(0, 60)),
+  )
+
+  // Anything the subset cannot answer faithfully must fall back, not lie.
+  check('test-path other drive falls back', run("Test-Path 'Cert:\\CurrentUser\\Root'") === null, '')
+  check('get-item registry falls back', run("Get-Item 'HKLM:\\SOFTWARE'") === null, '')
+  check('get-itemproperty all values falls back', run("Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'") === null, '')
+  check('get-childitem registry objects fall back', run("Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft'") === null, '')
+}
+
+// process properties the subset cannot model fall back instead of printing nothing
+{
+  check('process Path via variable falls back', run('$p = Get-Process explorer; $p.Path') === null, '')
+  check('process ExpandProperty Path falls back', run('Get-Process explorer | Select-Object -ExpandProperty Path') === null, '')
+
+  const ids = run('Get-Process explorer | Select-Object -ExpandProperty Id')
+  check('process ExpandProperty Id stays native', ids && ids.exitCode === 0 && ids.stdout.trim().length > 0, JSON.stringify(ids?.stdout))
+
+  const named = run('Get-Process explorer')
+  check(
+    'get-process positional name filters',
+    named && named.exitCode === 0 && named.stdout.includes('explorer') && !named.stdout.includes('svchost'),
+    JSON.stringify(named?.stdout?.slice(0, 60)),
+  )
+}
+
 console.log('PASS:\n  ' + ok.join('\n  '))
 if (bad.length) {
   console.log('FAIL:\n  ' + bad.join('\n  '))

@@ -1,5 +1,21 @@
 # 更新记录
 
+## v1.9.6
+
+- 修「快而错」的一类静默错：非文件系统盘符的路径（`HKLM:`、`HKCU:`、`Cert:`、`Env:`、`WSMan:`）
+  以前会被拼到 cwd 后面，`Test-Path 'HKLM:\…'` 1 ms 内返回 `False`、`Get-Item`/`Get-ChildItem`
+  报 `ENOENT 'C:\cwd\HKLM:\…'`——脚本据此判断“键不存在”会做错事。现在统一回退真引擎。
+- 注册表 PSDrive 只读原生支持（`reg.exe` 支撑，约 20 ms）：`Test-Path`（含 `-PathType`）、
+  `Get-ItemProperty`（`-Name` 或整键标量值，`REG_SZ/EXPAND_SZ/DWORD/QWORD`）、
+  `Get-ChildItem -Name`（列子键）。返回 RegistryKey 对象、通配符、`REG_BINARY`/`REG_MULTI_SZ`
+  等无法逐字段复刻的形态一律回退。
+- 修 `Get-Process` 的静默错：`Select-Object -ExpandProperty Path/Modules`、`$p.Path` 以前会返回
+  空且 exit 0（`tasklist` 没有这些属性）；现在读这些属性直接回退真引擎，集合属性做成员枚举
+  （`$procs.Name` 与 PowerShell 一致）。顺带修 `Get-Process explorer` 位置参数不过滤的问题。
+- `Select-Object` 的位置参数按 `-Property` 处理（`Select-Object Name,Id` 现在真的只选这两列），
+  `-ExpandProperty` 遇到对象上不存在的属性回退（真 PowerShell 在这个位置本来就报错）。
+- 测试：ps 110 → 124、exec 83 → 87；5 套 265 项全绿。
+
 ## v1.9.5
 
 - 修 `auto` 把 PowerShell 脚本判给 cmd：`2>&1` / `*>&1` 是流重定向（cmd 与 PowerShell 5.1

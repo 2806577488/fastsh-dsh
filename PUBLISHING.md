@@ -1,12 +1,12 @@
 # 发布与收录
 
 仓库：<https://github.com/2806577488/fastsh-dsh>
-当前版本：`v1.9.5`
+当前版本：`v1.9.6`
 
 ## 安装
 
 ```
-dsh plugin add git+https://github.com/2806577488/fastsh-dsh.git#v1.9.5
+dsh plugin add git+https://github.com/2806577488/fastsh-dsh.git#v1.9.6
 ```
 
 `git+` 源要求用户机器上装有 git；没有 git 的用户暂时装不了，等有 npm 包再解决。

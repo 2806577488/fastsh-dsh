@@ -516,6 +516,39 @@ function check(name, ok, detail) {
   check('quoted >nul untouched', quoted.exitCode === 0 && quoted.stdout.includes('see >nul here'), JSON.stringify(quoted.stdout))
 }
 
+// 26. registry PSDrive 走原生；不保真的形状回退真引擎
+{
+  const exists = await runCommand({
+    command: "Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'",
+    cwd: process.cwd(),
+  })
+  check(
+    'registry test-path native',
+    exists.exitCode === 0 && exists.stdout.trim() === 'True' && exists.durationMs < 1200,
+    `${exists.durationMs}ms ${exists.stdout.trim()}`,
+  )
+
+  const props = await runCommand({
+    command: "Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion' -Name ProductName",
+    cwd: process.cwd(),
+  })
+  check(
+    'registry value native',
+    props.exitCode === 0 && /ProductName : .+/.test(props.stdout) && props.durationMs < 1200,
+    `${props.durationMs}ms ${JSON.stringify(props.stdout.slice(0, 40))}`,
+  )
+
+  const cert = await runCommand({ command: "Test-Path 'Cert:\\CurrentUser\\Root'", cwd: process.cwd() })
+  check('non-filesystem drive falls back', cert.exitCode === 0 && cert.stdout.trim() === 'True' && cert.durationMs >= 900, `${cert.durationMs}ms`)
+
+  const proc = await runCommand({ command: 'Get-Process explorer | Select-Object -ExpandProperty Path', cwd: process.cwd() })
+  check(
+    'process Path falls back to real engine',
+    proc.exitCode === 0 && /explorer\.exe/i.test(proc.stdout) && proc.durationMs >= 900,
+    `${proc.durationMs}ms ${JSON.stringify(proc.stdout.trim().slice(0, 60))}`,
+  )
+}
+
 const failed = results.filter((r) => !r.ok)
 console.log(`\n${results.length - failed.length}/${results.length} passed`)
 process.exit(failed.length ? 1 : 0)
